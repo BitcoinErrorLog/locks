@@ -300,6 +300,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.status, VerificationTaskStatus::InProgress);
+        assert_eq!(
+            result.client_reference,
+            Some(ClientReference::from_str("order-instance-1").unwrap())
+        );
         assert_eq!(task_ids.generate_count(), 0);
         assert_eq!(tasks.insert_count(), 0);
         assert_eq!(tasks.update_count(), 0);

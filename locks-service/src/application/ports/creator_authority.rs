@@ -5,7 +5,8 @@ use crate::application::errors::ApplicationError;
 use crate::application::models::{
     CreatorAuthorityAuthKind, CreatorAuthorityRecord, CreatorConnectAuthorizationUrl,
     CreatorConnectFlowId, FrontendSessionCode, FrontendSessionCodeRecord, FrontendSessionRecord,
-    FrontendSessionToken, LegacyCreatorConnectFlowApproval, PendingCreatorConnectFlowRecord,
+    FrontendSessionToken, GrantCreatorConnectFlowApproval, GrantPopKeyId,
+    LegacyCreatorConnectFlowApproval, PendingCreatorConnectFlowRecord,
 };
 
 /// Secret-free status view for creator-granted homeserver authority.
@@ -163,6 +164,27 @@ pub trait LegacyCreatorConnectFlowClient: Send + Sync {
         &self,
         authorization_url: &CreatorConnectAuthorizationUrl,
     ) -> Result<LegacyCreatorConnectFlowApproval, ApplicationError>;
+}
+
+/// Object-safe seam for starting and completing grant-based Pubky creator connect flows.
+#[async_trait]
+pub trait GrantCreatorConnectFlowClient: Send + Sync {
+    /// Starts a `signin_grant` flow bound to the Lock Server PoP key `pop_key_id` and
+    /// returns the secret-bearing authorization URL.
+    async fn start_grant_creator_connect_flow(
+        &self,
+        requested_scopes: &[String],
+        pop_key_id: &GrantPopKeyId,
+    ) -> Result<CreatorConnectAuthorizationUrl, ApplicationError>;
+
+    /// Resumes a pending grant flow, awaits signer approval, and returns delegated
+    /// restore state. Fails unless the grant covers `requested_scopes`.
+    async fn await_grant_creator_connect_flow_approval(
+        &self,
+        authorization_url: &CreatorConnectAuthorizationUrl,
+        pop_key_id: &GrantPopKeyId,
+        requested_scopes: &[String],
+    ) -> Result<GrantCreatorConnectFlowApproval, ApplicationError>;
 }
 
 #[cfg(test)]

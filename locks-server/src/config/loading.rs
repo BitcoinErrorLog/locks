@@ -189,6 +189,9 @@ frontend_session_code_ttl_seconds = {} # One-time callback code lifetime. Keep s
 [creator_authority_acquisition.legacy_connect]
 allowed_return_origins = [] # Origins allowed to receive auth callback codes, e.g. ["https://pubky.app"]. Empty rejects all /connect return_to values; ["*"] is dev-only and unsafe for staging/prod.
 
+# [creator_authority_acquisition.grant_connect]
+# client_id = "locks.example" # Uncomment to offer a signin_grant QR (Bitkit) beside the Ring QR. Public hostname shown to the signer; requires a keypair-seed lock_server_secret_key.
+
 [secrets]
 creator_authority_key_env = "{}" # Environment variable containing a 32-byte base64url key for encrypting creator authority at rest. Rotating requires data migration.
 

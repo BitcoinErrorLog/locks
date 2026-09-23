@@ -141,6 +141,9 @@ mod tests {
             authorization_url: CreatorConnectAuthorizationUrl::new(
                 "pubkyauth://relay.example/connect?client_secret=super-secret-client-secret",
             ),
+            grant_authorization_url: Some(CreatorConnectAuthorizationUrl::new(
+                "pubkyauth://signin_grant?secret=super-secret-grant-client-secret",
+            )),
             requested_scopes: vec![
                 "/pub/locks.app/:rw".to_owned(),
                 "/priv/locks.app/:rw".to_owned(),
@@ -154,6 +157,7 @@ mod tests {
         assert!(debug.contains("PendingCreatorConnectFlowRecord"));
         assert!(debug.contains("<redacted>"));
         assert!(!debug.contains("super-secret-client-secret"));
+        assert!(!debug.contains("super-secret-grant-client-secret"));
         assert!(!debug.contains("pubkyauth://relay.example"));
         assert!(!record.is_expired_at(datetime!(2026-06-17 12:04:59 UTC)));
         assert!(record.is_expired_at(datetime!(2026-06-17 12:05:00 UTC)));

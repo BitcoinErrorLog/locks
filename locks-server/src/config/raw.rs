@@ -10,11 +10,11 @@ use url::Url;
 use super::defaults::{DEFAULT_CREATOR_AUTHORITY_KEY_ENV, PUBLIC_KEY_PLACEHOLDER};
 use super::schema::{
     ConfigError, ContentLocksConfig, CreatorAuthorityAcquisitionConfig,
-    CreatorAuthorityAcquisitionMethod, DatabaseConfig, LegacyConnectAcquisitionConfig,
-    LockServerCredentialsConfig, LockServerRuntimeConfig, LoggingConfig,
-    PAYKIT_REQUEST_TIMEOUT_SECONDS, PaykitConfig, PkdnsConfig, PubkyConfig, PubkyNetwork,
-    PubkyResolution, RateLimitsConfig, RuntimeConfig, RuntimeEnvironment, SecretsConfig,
-    VerificationSubmissionRateLimitConfig, WorkerConfig,
+    CreatorAuthorityAcquisitionMethod, DatabaseConfig, GrantConnectAcquisitionConfig,
+    LegacyConnectAcquisitionConfig, LockServerCredentialsConfig, LockServerRuntimeConfig,
+    LoggingConfig, PAYKIT_REQUEST_TIMEOUT_SECONDS, PaykitConfig, PkdnsConfig, PubkyConfig,
+    PubkyNetwork, PubkyResolution, RateLimitsConfig, RuntimeConfig, RuntimeEnvironment,
+    SecretsConfig, VerificationSubmissionRateLimitConfig, WorkerConfig,
 };
 
 #[derive(Debug, Deserialize)]
@@ -289,6 +289,8 @@ struct RawCreatorAuthorityAcquisitionConfig {
     frontend_session_code_ttl_seconds: u64,
     #[serde(default)]
     legacy_connect: RawLegacyConnectAcquisitionConfig,
+    #[serde(default)]
+    grant_connect: Option<RawGrantConnectAcquisitionConfig>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -296,6 +298,12 @@ struct RawCreatorAuthorityAcquisitionConfig {
 struct RawLegacyConnectAcquisitionConfig {
     #[serde(default)]
     allowed_return_origins: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawGrantConnectAcquisitionConfig {
+    client_id: String,
 }
 
 impl Default for RawCreatorAuthorityAcquisitionConfig {
@@ -307,6 +315,7 @@ impl Default for RawCreatorAuthorityAcquisitionConfig {
             frontend_session_ttl_seconds: default_frontend_session_ttl_seconds(),
             frontend_session_code_ttl_seconds: default_frontend_session_code_ttl_seconds(),
             legacy_connect: RawLegacyConnectAcquisitionConfig::default(),
+            grant_connect: None,
         }
     }
 }
@@ -325,6 +334,29 @@ fn default_frontend_session_ttl_seconds() -> u64 {
 
 fn default_frontend_session_code_ttl_seconds() -> u64 {
     120
+}
+
+fn validate_grant_connect_client_id(value: String) -> Result<String, ConfigError> {
+    let invalid = || ConfigError::InvalidGrantConnectClientId(value.clone());
+    if value.is_empty() || value.len() > 253 || value.chars().any(|ch| !ch.is_ascii_graphic()) {
+        return Err(invalid());
+    }
+    let url = url::Url::parse(&format!("https://{value}/")).map_err(|_| invalid())?;
+    let host = url.host_str().ok_or_else(invalid)?;
+    let authority = match url.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_owned(),
+    };
+    if authority != value
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.path() != "/"
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(invalid());
+    }
+    Ok(value)
 }
 
 fn validate_allowed_return_origins(values: Vec<String>) -> Result<Vec<String>, ConfigError> {
@@ -566,6 +598,13 @@ impl RawCreatorAuthorityAcquisitionConfig {
             legacy_connect: LegacyConnectAcquisitionConfig {
                 allowed_return_origins,
             },
+            grant_connect: self
+                .grant_connect
+                .map(|grant_connect| {
+                    validate_grant_connect_client_id(grant_connect.client_id)
+                        .map(|client_id| GrantConnectAcquisitionConfig { client_id })
+                })
+                .transpose()?,
         })
     }
 }

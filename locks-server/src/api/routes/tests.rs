@@ -21,10 +21,12 @@ use locks_service::application::errors::ApplicationError;
 use locks_service::application::models::{
     CreatorAuthorityAuthKind, CreatorAuthorityRecord, CreatorAuthoritySecret,
     CreatorConnectAuthorizationUrl, CreatorConnectFlowId, FrontendSessionRecord,
-    FrontendSessionToken, GuardedResourceRecord, LegacyCreatorConnectFlowApproval,
-    PendingCreatorConnectFlowRecord,
+    FrontendSessionToken, GrantCreatorConnectFlowApproval, GrantPopKeyId, GuardedResourceRecord,
+    LegacyCreatorConnectFlowApproval, PendingCreatorConnectFlowRecord,
 };
-use locks_service::application::ports::{Clock, LegacyCreatorConnectFlowClient};
+use locks_service::application::ports::{
+    Clock, GrantCreatorConnectFlowClient, LegacyCreatorConnectFlowClient,
+};
 use serde_json::{Value, json};
 use sqlx::postgres::PgPoolOptions;
 use time::macros::datetime;
@@ -32,7 +34,10 @@ use tower::ServiceExt;
 
 use super::router;
 use crate::api::auth::parse_frontend_session_token;
-use crate::api::creator_authority::{escape_html, validate_return_to_url};
+use crate::api::creator_authority::{
+    ConnectDeliveryMode, escape_html, render_authorization_qr_svg, render_connect_shell_html,
+    render_ring_scan_html, validate_return_to_url,
+};
 use crate::api::dtos::{
     AuthenticatedCreateContentLockHttpRequest, AuthenticatedSetLockServicePointerHttpRequest,
     IssueAccessCredentialHttpRequest, SubmitProofBundleHttpRequest,
@@ -2684,6 +2689,217 @@ async fn connect_shell_completion_redirect_does_not_include_auth_url_or_session_
     assert!(!location.contains("frontend_session_token"));
 }
 
+const GRANT_URL: &str = "pubkyauth://signin_grant?fake-secret-grant-url";
+const GRANT_STATE: &str = "{\"grant_jws\":\"fake-grant-jws-material\"}";
+
+fn grant_connect_state(
+    allowed_return_origins: Vec<String>,
+) -> (
+    AppState,
+    Arc<CountingGrantConnectFlowClient>,
+    Arc<CountingLegacyConnectFlowClient>,
+) {
+    let legacy = Arc::new(CountingLegacyConnectFlowClient::default());
+    let grant = Arc::new(CountingGrantConnectFlowClient::default());
+    let state = test_state_with_creator_connect_return_origins(allowed_return_origins)
+        .with_legacy_creator_connect_flow_client(legacy.clone())
+        .with_grant_creator_connect_flow_client(Some(grant.clone()));
+    (state, grant, legacy)
+}
+
+#[tokio::test]
+async fn ring_cookie_connect_unchanged() {
+    let client = Arc::new(CountingLegacyConnectFlowClient::default());
+    let state =
+        test_state_with_creator_connect_return_origins(vec!["https://pubky.app".to_owned()])
+            .with_legacy_creator_connect_flow_client(client.clone());
+
+    for delivery in ["", "&delivery=postmessage"] {
+        let response = router(state.clone())
+            .oneshot(empty_request(
+                "GET",
+                &format!(
+                    "/connect?return_to=https%3A%2F%2Fpubky.app%2Flocks%2Fconnected&state=opaque-state{delivery}"
+                ),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = String::from_utf8(response_bytes(response).await).unwrap();
+
+        assert!(body.contains(&render_ring_scan_html("pubkyauth://fake-secret-flow-url")));
+        assert_eq!(body.matches("data-testid=\"pubky-auth-qr\"").count(), 1);
+        assert_eq!(body.matches("class=\"authorize-btn\"").count(), 1);
+        assert_eq!(
+            body.matches("<svg aria-label=\"Pubky authorization QR code\"")
+                .count(),
+            1
+        );
+        assert!(!body.contains("bitkit"));
+        assert!(!body.contains("Bitkit"));
+        assert!(!body.contains("signin_grant"));
+        assert!(!body.contains("class=\"qr-label\""));
+        assert!(!body.contains("class=\"scan-pair\""));
+    }
+    assert_eq!(client.start_call_count(), 2);
+}
+
+/// Captured from `master` @ a9d52b8 (before grant connect) with the same inputs.
+#[test]
+fn ring_cookie_connect_shell_is_byte_identical_to_pre_grant_capture() {
+    const COOKIE_URL: &str = "pubkyauth://signin?caps=/pub/locks.app/:rw,/priv/locks.app/:rw&relay=https://httprelay.pubky.app/inbox&secret=golden-secret";
+    for (delivery, golden) in [
+        (
+            ConnectDeliveryMode::Redirect,
+            include_str!("../../../tests/fixtures/connect_shell/cookie-only-redirect.html"),
+        ),
+        (
+            ConnectDeliveryMode::PostMessage,
+            include_str!("../../../tests/fixtures/connect_shell/cookie-only-postmessage.html"),
+        ),
+    ] {
+        let html = render_connect_shell_html(
+            "flow-golden",
+            COOKIE_URL,
+            None,
+            delivery,
+            "https://pubky.app",
+            "opaque-state",
+        );
+        assert_eq!(html, golden, "{delivery:?}");
+    }
+}
+
+#[tokio::test]
+async fn grant_connect_shell_offers_bitkit_qr_beside_ring_qr() {
+    let (state, grant, legacy) = grant_connect_state(vec!["https://pubky.app".to_owned()]);
+
+    let response = router(state)
+        .oneshot(empty_request(
+            "GET",
+            "/connect?return_to=https%3A%2F%2Fpubky.app%2Flocks%2Fconnected&state=opaque-state&delivery=postmessage",
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(header::CONTENT_SECURITY_POLICY)
+            .unwrap(),
+        "frame-ancestors https://pubky.app"
+    );
+    let body = String::from_utf8(response_bytes(response).await).unwrap();
+    assert_eq!(legacy.start_call_count(), 1);
+    assert_eq!(grant.start_call_count(), 1);
+
+    let ring = body.find("data-testid=\"pubky-auth-qr\"").expect("ring qr");
+    let bitkit = body
+        .find("data-testid=\"bitkit-grant-qr\"")
+        .expect("bitkit qr");
+    assert!(ring < bitkit, "Ring QR stays first");
+    assert!(body.contains(&render_authorization_qr_svg(
+        "pubkyauth://fake-secret-flow-url"
+    )));
+    assert!(body.contains(&render_authorization_qr_svg(GRANT_URL)));
+    assert!(body.contains("href=\"pubkyauth://fake-secret-flow-url\""));
+    assert!(body.contains(&format!(
+        "data-testid=\"bitkit-grant-authorize\" href=\"{}\"",
+        escape_html(GRANT_URL)
+    )));
+    assert!(body.contains("<span class=\"qr-label\">Approve in Pubky Ring</span>"));
+    assert!(body.contains("<span class=\"qr-label\">Approve in Bitkit</span>"));
+    assert!(body.contains("Continue with Pubky Ring"));
+    assert!(body.contains("Continue with Bitkit"));
+    assert!(!body.contains("fake-grant-jws-material"));
+}
+
+#[tokio::test]
+async fn grant_connect_rejects_unlisted_return_origin() {
+    let (state, grant, legacy) = grant_connect_state(vec!["https://pubky.app".to_owned()]);
+
+    for origin in [
+        "https%3A%2F%2Fevil.example%2Fcallback",
+        "https%3A%2F%2Fpubky.app.evil.example%2Fcallback",
+        "http%3A%2F%2Fpubky.app%2Fcallback",
+        "https%3A%2F%2Fpubky.app%3A8443%2Fcallback",
+    ] {
+        let response = router(state.clone())
+            .oneshot(empty_request(
+                "GET",
+                &format!("/connect?return_to={origin}&state=opaque-state&delivery=postmessage"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{origin}");
+        let body = response_json(response).await;
+        assert_eq!(body["error"]["code"], "invalid_request");
+    }
+    assert_eq!(grant.start_call_count(), 0);
+    assert_eq!(legacy.start_call_count(), 0);
+}
+
+#[tokio::test]
+async fn grant_connect_postmessage_carries_only_state_and_code() {
+    let (state, grant, _legacy) = grant_connect_state(vec!["https://pubky.app".to_owned()]);
+    let state =
+        state.with_legacy_creator_connect_flow_client(Arc::new(PendingLegacyConnectFlowClient));
+    let now = time::OffsetDateTime::now_utc();
+    state
+        .creator_connect_flows()
+        .insert_pending_creator_connect_flow(PendingCreatorConnectFlowRecord {
+            flow_id: CreatorConnectFlowId::new("flow-grant"),
+            return_to: "https://pubky.app/locks/connected".to_owned(),
+            state: "opaque-state".to_owned(),
+            authorization_url: CreatorConnectAuthorizationUrl::new(
+                "pubkyauth://fake-secret-flow-url",
+            ),
+            grant_authorization_url: Some(CreatorConnectAuthorizationUrl::new(GRANT_URL)),
+            requested_scopes: vec![
+                "/pub/locks.app/:rw".to_owned(),
+                "/priv/locks.app/:rw".to_owned(),
+            ],
+            created_at: now,
+            expires_at: now + time::Duration::minutes(5),
+        })
+        .await
+        .unwrap();
+
+    let response = router(state.clone())
+        .oneshot(empty_request(
+            "POST",
+            "/connect/flow-grant/complete?delivery=postmessage",
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await;
+    let keys: Vec<&str> = body
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(keys, vec!["code", "state"]);
+    assert_eq!(body["state"], "opaque-state");
+    let text = body.to_string();
+    assert!(!text.contains("fake-grant-jws-material"));
+    assert!(!text.contains("pubkyauth"));
+    assert!(!text.contains("session-secret"));
+    assert_eq!(grant.await_call_count(), 1);
+
+    let authority = state
+        .creator_authorities()
+        .get_creator_authority(&creator())
+        .await
+        .unwrap()
+        .expect("grant authority stored");
+    assert_eq!(authority.auth_kind, CreatorAuthorityAuthKind::Grant);
+    assert_eq!(authority.secret.expose_secret(), GRANT_STATE);
+}
+
 #[tokio::test]
 async fn self_relay_acquisition_routes_are_not_mounted() {
     let mut config = test_config(RuntimeEnvironment::Production, false);
@@ -2713,6 +2929,7 @@ async fn raw_creator_connect_flow_routes_are_never_mounted() {
         legacy_connect: crate::config::LegacyConnectAcquisitionConfig {
             allowed_return_origins: Vec::new(),
         },
+        grant_connect: None,
     };
     let app = router(AppState::new_empty_in_memory(config));
 
@@ -3312,6 +3529,7 @@ async fn seed_pending_creator_connect_flow(
             authorization_url: CreatorConnectAuthorizationUrl::new(
                 "pubkyauth://fake-secret-flow-url",
             ),
+            grant_authorization_url: None,
             requested_scopes: vec![
                 "/pub/locks.app/:rw".to_owned(),
                 "/priv/locks.app/:rw".to_owned(),
@@ -3362,6 +3580,70 @@ impl LegacyCreatorConnectFlowClient for CountingLegacyConnectFlowClient {
             creator: creator(),
             session_secret: CreatorAuthoritySecret::new("session-secret"),
         })
+    }
+}
+
+#[derive(Default)]
+struct CountingGrantConnectFlowClient {
+    start_calls: AtomicUsize,
+    await_calls: AtomicUsize,
+}
+
+impl CountingGrantConnectFlowClient {
+    fn start_call_count(&self) -> usize {
+        self.start_calls.load(Ordering::SeqCst)
+    }
+
+    fn await_call_count(&self) -> usize {
+        self.await_calls.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl GrantCreatorConnectFlowClient for CountingGrantConnectFlowClient {
+    async fn start_grant_creator_connect_flow(
+        &self,
+        _requested_scopes: &[String],
+        _pop_key_id: &GrantPopKeyId,
+    ) -> Result<CreatorConnectAuthorizationUrl, ApplicationError> {
+        self.start_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(CreatorConnectAuthorizationUrl::new(GRANT_URL))
+    }
+
+    async fn await_grant_creator_connect_flow_approval(
+        &self,
+        _authorization_url: &CreatorConnectAuthorizationUrl,
+        _pop_key_id: &GrantPopKeyId,
+        requested_scopes: &[String],
+    ) -> Result<GrantCreatorConnectFlowApproval, ApplicationError> {
+        self.await_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(GrantCreatorConnectFlowApproval {
+            creator: creator(),
+            grant_state: CreatorAuthoritySecret::new(GRANT_STATE),
+            granted_scopes: requested_scopes.to_vec(),
+            grant_expires_at: time::OffsetDateTime::now_utc() + time::Duration::days(30),
+        })
+    }
+}
+
+struct PendingLegacyConnectFlowClient;
+
+#[async_trait]
+impl LegacyCreatorConnectFlowClient for PendingLegacyConnectFlowClient {
+    async fn start_legacy_creator_connect_flow(
+        &self,
+        _requested_scopes: &[String],
+    ) -> Result<CreatorConnectAuthorizationUrl, ApplicationError> {
+        Ok(CreatorConnectAuthorizationUrl::new(
+            "pubkyauth://fake-secret-flow-url",
+        ))
+    }
+
+    async fn await_legacy_creator_connect_flow_approval(
+        &self,
+        _authorization_url: &CreatorConnectAuthorizationUrl,
+    ) -> Result<LegacyCreatorConnectFlowApproval, ApplicationError> {
+        std::future::pending().await
     }
 }
 

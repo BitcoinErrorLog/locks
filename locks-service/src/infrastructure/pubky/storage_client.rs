@@ -7,6 +7,9 @@ use locks_core::lock_policy::{
 use crate::application::errors::ApplicationError;
 use crate::application::models::{CreatorAuthorityAuthKind, CreatorAuthoritySecret};
 use crate::application::ports::{CreatorAuthorityManager, CreatorAuthorityStore};
+use crate::infrastructure::pubky::grant_connect_flow::{
+    LockServerGrantPopKeys, restore_grant_session,
+};
 use crate::infrastructure::pubky::legacy_connect_flow::creator_from_pubky_public_key_z32;
 
 /// Bytes fetched from a creator-owned Pubky homeserver resource.
@@ -165,9 +168,16 @@ pub trait PubkySessionImporter: Send + Sync {
         &self,
         secret: &CreatorAuthoritySecret,
     ) -> Result<Self::Session, ApplicationError>;
+
+    /// Restores a grant-backed session from delegated grant restore state.
+    async fn import_grant_session(
+        &self,
+        secret: &CreatorAuthoritySecret,
+    ) -> Result<Self::Session, ApplicationError>;
 }
 
-/// Creator-scoped storage provider backed by persisted legacy cookie creator authority.
+/// Creator-scoped storage provider backed by persisted creator authority: legacy cookie
+/// secrets and delegated grant restore state.
 #[derive(Debug)]
 pub struct LegacyCookieCreatorScopedPubkyStorageProvider<S, I> {
     store: S,
@@ -200,14 +210,16 @@ where
             .await?
             .ok_or(ApplicationError::CreatorAuthorityUnavailable)?;
 
-        if record.auth_kind != CreatorAuthorityAuthKind::LegacyCookie {
-            return Err(ApplicationError::CreatorAuthorityUnavailable);
-        }
-
-        let session = self
-            .importer
-            .import_legacy_cookie_session(&record.secret)
-            .await?;
+        let session = match record.auth_kind {
+            CreatorAuthorityAuthKind::LegacyCookie => {
+                self.importer
+                    .import_legacy_cookie_session(&record.secret)
+                    .await?
+            }
+            CreatorAuthorityAuthKind::Grant => {
+                self.importer.import_grant_session(&record.secret).await?
+            }
+        };
         let restored_creator = creator_from_pubky_public_key_z32(&session.public_key_z32())?;
         if &restored_creator != creator {
             return Err(ApplicationError::CreatorAuthorityUnavailable);
@@ -217,15 +229,26 @@ where
     }
 }
 
-/// Real Pubky SDK importer for legacy cookie-session secrets.
+/// Real Pubky SDK importer for legacy cookie-session secrets and, when the Lock Server grant
+/// PoP keys are available, delegated grant restore state.
 #[derive(Debug, Clone)]
 pub struct PubkyLegacyCookieSessionImporter {
     client: pubky::PubkyHttpClient,
+    grant_pop_keys: Option<LockServerGrantPopKeys>,
 }
 
 impl PubkyLegacyCookieSessionImporter {
     pub fn new(client: pubky::PubkyHttpClient) -> Self {
-        Self { client }
+        Self {
+            client,
+            grant_pop_keys: None,
+        }
+    }
+
+    /// Enables restoring `Grant` records with the Lock Server grant PoP keys.
+    pub fn with_grant_pop_keys(mut self, grant_pop_keys: LockServerGrantPopKeys) -> Self {
+        self.grant_pop_keys = Some(grant_pop_keys);
+        self
     }
 }
 
@@ -243,6 +266,19 @@ impl PubkySessionImporter for PubkyLegacyCookieSessionImporter {
             .map_err(|_| ApplicationError::CreatorAuthoritySecret {
                 message: "failed to restore legacy creator authority secret".to_owned(),
             })
+    }
+
+    async fn import_grant_session(
+        &self,
+        secret: &CreatorAuthoritySecret,
+    ) -> Result<Self::Session, ApplicationError> {
+        let grant_pop_keys = self
+            .grant_pop_keys
+            .as_ref()
+            .ok_or(ApplicationError::CreatorAuthorityUnavailable)?;
+        restore_grant_session(&self.client, grant_pop_keys, secret)
+            .await
+            .map(PubkyImportedSession)
     }
 }
 
@@ -706,19 +742,53 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_cookie_provider_non_legacy_auth_kind_returns_unavailable_without_importing() {
+    async fn grant_record_restores_through_grant_import_not_cookie_slot() {
         let store = FakeCreatorAuthorityStore::new(Some(CreatorAuthorityRecord {
             auth_kind: CreatorAuthorityAuthKind::Grant,
-            ..creator_authority_record("grant-secret")
+            ..creator_authority_record("grant-restore-state")
         }));
         let importer =
             FakePubkySessionImporter::new(Ok(FakeImportedPubkySession::for_creator(creator_z32())));
         let provider = LegacyCookieCreatorScopedPubkyStorageProvider::new(store, importer);
 
-        let result = provider.storage_for_creator(&creator()).await;
+        provider.storage_for_creator(&creator()).await.unwrap();
 
-        assert_storage_error(result, ApplicationError::CreatorAuthorityUnavailable);
         assert_eq!(provider.importer().seen_secrets(), Vec::<String>::new());
+        assert_eq!(
+            provider.importer().seen_grant_states(),
+            vec!["grant-restore-state".to_owned()]
+        );
+    }
+
+    #[tokio::test]
+    async fn grant_record_for_another_issuer_returns_unavailable() {
+        let store = FakeCreatorAuthorityStore::new(Some(CreatorAuthorityRecord {
+            auth_kind: CreatorAuthorityAuthKind::Grant,
+            ..creator_authority_record("grant-restore-state")
+        }));
+        let importer = FakePubkySessionImporter::new(Ok(FakeImportedPubkySession::for_creator(
+            other_creator_z32(),
+        )));
+        let provider = LegacyCookieCreatorScopedPubkyStorageProvider::new(store, importer);
+
+        let error = storage_error(provider.storage_for_creator(&creator()).await);
+
+        assert_eq!(error, ApplicationError::CreatorAuthorityUnavailable);
+        assert!(!format!("{error:?}").contains("grant-restore-state"));
+    }
+
+    #[tokio::test]
+    async fn sdk_importer_without_grant_keys_refuses_grant_records() {
+        let importer = super::PubkyLegacyCookieSessionImporter::new(
+            pubky::PubkyHttpClient::testnet().unwrap(),
+        );
+
+        let error = importer
+            .import_grant_session(&CreatorAuthoritySecret::new("grant-restore-state"))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error, ApplicationError::CreatorAuthorityUnavailable);
     }
 
     #[tokio::test]
@@ -1067,6 +1137,7 @@ mod tests {
     struct FakePubkySessionImporter {
         result: Result<FakeImportedPubkySession, ApplicationError>,
         seen_secrets: Mutex<Vec<String>>,
+        seen_grant_states: Mutex<Vec<String>>,
     }
 
     impl FakePubkySessionImporter {
@@ -1074,11 +1145,16 @@ mod tests {
             Self {
                 result,
                 seen_secrets: Mutex::new(Vec::new()),
+                seen_grant_states: Mutex::new(Vec::new()),
             }
         }
 
         fn seen_secrets(&self) -> Vec<String> {
             self.seen_secrets.lock().unwrap().clone()
+        }
+
+        fn seen_grant_states(&self) -> Vec<String> {
+            self.seen_grant_states.lock().unwrap().clone()
         }
     }
 
@@ -1091,6 +1167,17 @@ mod tests {
             secret: &CreatorAuthoritySecret,
         ) -> Result<Self::Session, ApplicationError> {
             self.seen_secrets
+                .lock()
+                .unwrap()
+                .push(secret.expose_secret().to_owned());
+            self.result.clone()
+        }
+
+        async fn import_grant_session(
+            &self,
+            secret: &CreatorAuthoritySecret,
+        ) -> Result<Self::Session, ApplicationError> {
+            self.seen_grant_states
                 .lock()
                 .unwrap()
                 .push(secret.expose_secret().to_owned());

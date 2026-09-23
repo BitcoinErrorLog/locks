@@ -10,7 +10,8 @@ use crate::application::errors::ApplicationError;
 pub enum CreatorAuthorityAuthKind {
     /// Interim legacy cookie/session auth flow.
     LegacyCookie,
-    /// Future grant-based auth flow.
+    /// Grant + Proof-of-Possession auth flow. The stored secret is delegated grant
+    /// restore state; the PoP private key is held by the Lock Server outside the store.
     Grant,
 }
 
@@ -110,6 +111,54 @@ impl fmt::Debug for LegacyCreatorConnectFlowApproval {
     }
 }
 
+/// Identifier of the Lock-Server-held key that signs grant Proof-of-Possession proofs.
+///
+/// Not secret. The private key is derived from the Lock Server signing seed and this id
+/// whenever it is needed and is never persisted.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct GrantPopKeyId(String);
+
+impl GrantPopKeyId {
+    /// Wraps a stored key id.
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    /// Key id for the grant QR of one pending connect flow.
+    pub fn for_connect_flow(flow_id: &CreatorConnectFlowId) -> Self {
+        Self(format!("locks-connect-v1.{}", flow_id.as_str()))
+    }
+
+    /// Returns the key id value.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Approved grant auth-flow material, converted to Locks creator-authority state.
+#[derive(Clone, PartialEq, Eq)]
+pub struct GrantCreatorConnectFlowApproval {
+    /// Approved creator identity: the grant issuer.
+    pub creator: CreatorPubky,
+    /// Serialized delegated grant restore state. It holds no private key.
+    pub grant_state: CreatorAuthoritySecret,
+    /// Capabilities carried by the approved grant.
+    pub granted_scopes: Vec<String>,
+    /// Grant expiry reported by the grant claims.
+    pub grant_expires_at: OffsetDateTime,
+}
+
+impl fmt::Debug for GrantCreatorConnectFlowApproval {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GrantCreatorConnectFlowApproval")
+            .field("creator", &self.creator)
+            .field("grant_state", &"<redacted>")
+            .field("granted_scopes", &self.granted_scopes)
+            .field("grant_expires_at", &self.grant_expires_at)
+            .finish()
+    }
+}
+
 /// Server-generated identifier for a pending creator connect flow.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CreatorConnectFlowId(String);
@@ -161,6 +210,9 @@ pub struct PendingCreatorConnectFlowRecord {
     pub state: String,
     /// Secret-bearing authorization URL needed to resume/await Pubky approval.
     pub authorization_url: CreatorConnectAuthorizationUrl,
+    /// Secret-bearing grant authorization URL offered beside the cookie URL, when the
+    /// Lock Server has grant connect configured.
+    pub grant_authorization_url: Option<CreatorConnectAuthorizationUrl>,
     /// Scopes requested for the Lock Server's creator-granted homeserver session.
     pub requested_scopes: Vec<String>,
     /// Creation timestamp.
@@ -183,6 +235,10 @@ impl fmt::Debug for PendingCreatorConnectFlowRecord {
             .field("return_to", &self.return_to)
             .field("state", &self.state)
             .field("authorization_url", &"<redacted>")
+            .field(
+                "grant_authorization_url",
+                &self.grant_authorization_url.as_ref().map(|_| "<redacted>"),
+            )
             .field("requested_scopes", &self.requested_scopes)
             .field("created_at", &self.created_at)
             .field("expires_at", &self.expires_at)

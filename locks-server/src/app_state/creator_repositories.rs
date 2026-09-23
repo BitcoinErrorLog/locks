@@ -8,7 +8,7 @@ use locks_service::{
     infrastructure::{
         postgres::PostgresCreatorAuthorityStore,
         pubky::{
-            LegacyCookieCreatorScopedPubkyStorageProvider,
+            LegacyCookieCreatorScopedPubkyStorageProvider, LockServerGrantPopKeys,
             ProviderBackedPubkyHomeserverStorageClient, PubkyContentLockRepository,
             PubkyEntitlementRepository, PubkyHomeserverStorageClient,
             PubkyLegacyCookieSessionImporter, PubkyLockServicePointerRepository,
@@ -43,8 +43,13 @@ impl CreatorRepositoryAdapters {
     pub(super) fn pubky_homeserver(
         creator_authority_store: PostgresCreatorAuthorityStore,
         pubky_http_client: pubky::PubkyHttpClient,
+        grant_pop_keys: Option<LockServerGrantPopKeys>,
     ) -> Self {
-        let importer = PubkyLegacyCookieSessionImporter::new(pubky_http_client);
+        let importer = match grant_pop_keys {
+            Some(grant_pop_keys) => PubkyLegacyCookieSessionImporter::new(pubky_http_client)
+                .with_grant_pop_keys(grant_pop_keys),
+            None => PubkyLegacyCookieSessionImporter::new(pubky_http_client),
+        };
         let provider =
             LegacyCookieCreatorScopedPubkyStorageProvider::new(creator_authority_store, importer);
         let client: Arc<dyn PubkyHomeserverStorageClient> =

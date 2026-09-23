@@ -13,7 +13,8 @@ use locks_service::application::{
     ports::{
         AccessCredentialStore, CreatorAuthorityManager, CreatorAuthorityStore,
         CreatorConnectFlowStore, FrontendSessionCodeStore, FrontendSessionStore,
-        LegacyCreatorConnectFlowClient, VerificationTaskClaimer, VerificationTaskRepository,
+        GrantCreatorConnectFlowClient, LegacyCreatorConnectFlowClient, VerificationTaskClaimer,
+        VerificationTaskRepository,
     },
 };
 use time::OffsetDateTime;
@@ -30,6 +31,7 @@ pub(super) struct PrivateRuntimeAdapters {
     pub(super) frontend_sessions: Arc<dyn FrontendSessionStore>,
     pub(super) creator_authority_manager: Arc<dyn CreatorAuthorityManager>,
     pub(super) legacy_creator_connect_flow_client: Arc<dyn LegacyCreatorConnectFlowClient>,
+    pub(super) grant_creator_connect_flow_client: Option<Arc<dyn GrantCreatorConnectFlowClient>>,
 }
 
 #[derive(Debug, Clone, Default)]

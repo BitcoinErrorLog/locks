@@ -114,6 +114,21 @@ When enabled, the Lock Server starts and completes legacy Pubky auth, stores enc
 
 `legacy_connect.allowed_return_origins` entries are exact `http`/`https` origins with scheme and authority only. Paths, query strings, and fragments are rejected. A single wildcard entry, `allowed_return_origins = ["*"]`, is accepted and means `/connect` may use the origin from `return_to`; wildcard must not be mixed with concrete origins.
 
+### Grant connect (Bitkit)
+
+```toml
+[creator_authority_acquisition.grant_connect]
+client_id = "locks.example"
+```
+
+When `grant_connect` is set, `/connect` shows a second QR, `pubkyauth://signin_grant`, beside the unchanged Pubky Ring cookie QR. Bitkit 2.5 and later accept only grant URLs. Both QRs request the same capabilities, and the pending flow completes with whichever the signer approves first. When the section is absent, `/connect` renders exactly the cookie-only shell.
+
+- `client_id` is the Lock Server's public hostname, with an optional port. The signer shows it as display identity. It is not an allow-list: `allowed_return_origins` stays the only return gate, and the completion body is still `{ state, code }`.
+- The grant binds a Proof-of-Possession key held by the Lock Server. Each flow's key is derived from the `credentials.lock_server_secret_key` seed and a per-flow key id (BLAKE3 `derive_key`). The private key is never stored. Grant connect therefore requires a `keypair-seed:` secret key, and startup fails when the section is set without one.
+- An approved grant is stored as a `grant` creator authority. The encrypted `secret` column holds only the delegated restore state: grant JWS, homeserver key, key id and PoP public key. Publishing restores it with `GrantCredential::import_delegated_state`, which mints a fresh homeserver bearer from the grant and a new PoP proof.
+- Rotating the Lock Server seed, or its public key, orphans every stored grant authority. The affected creators connect again.
+- The Lock Server cannot revoke a scoped grant, so a stored grant stays valid on the homeserver until its `exp`. Deleting the creator authority record stops the Lock Server from using it.
+
 ## PKARR and browser SDK reachability
 
 The Lock Server public key is also the PKARR service pointer clients resolve to reach the Lock Server. Locks publishes and republishes that record from configured signing material.

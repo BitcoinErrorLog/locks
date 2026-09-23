@@ -57,7 +57,7 @@ const POSTMESSAGE_RESIZE_TYPE: &str = "locks-auth-resize";
 /// unaffected; `PostMessage` is opt-in via `?delivery=postmessage` and posts `{ state, code }` to
 /// the embedding parent window instead of navigating anywhere.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ConnectDeliveryMode {
+pub(super) enum ConnectDeliveryMode {
     Redirect,
     PostMessage,
 }
@@ -98,6 +98,9 @@ pub(super) async fn connect_shell_start(
     let response = start_creator_connect_flow(
         state.creator_connect_flows().as_ref(),
         state.legacy_creator_connect_flow_client().as_ref(),
+        state
+            .grant_creator_connect_flow_client()
+            .map(|client| client.as_ref()),
         state.creator_connect_flow_id_generator().as_ref(),
         state.clock().as_ref(),
         StartCreatorConnectFlowRequest {
@@ -110,6 +113,10 @@ pub(super) async fn connect_shell_start(
     let html = render_connect_shell_html(
         response.flow_id.as_str(),
         response.authorization_url.expose_url(),
+        response
+            .grant_authorization_url
+            .as_ref()
+            .map(|url| url.expose_url()),
         delivery,
         &target_origin,
         &callback_state,
@@ -168,6 +175,18 @@ body.embed{padding:0}
 body.embed .scan{width:100%}
 "#;
 
+/// Extra styles for the two-signer shell, appended only when the grant QR is offered so the
+/// cookie-only shell stays byte-identical. The Pubky Ring and Bitkit QRs sit side by side and
+/// wrap on narrow frames; their labels stay visible when embedded because the embedder's copy
+/// cannot tell the two codes apart.
+const SCAN_PAIR_CSS: &str = r#"
+.scan-pair{display:flex;flex-wrap:wrap;justify-content:center;gap:24px;width:100%}
+.scan-pair .scan{width:auto;gap:12px}
+.qr-label{font-size:14px;line-height:20px;font-weight:700;color:#d4d4db;text-align:center}
+body.embed .scan-pair .scan{width:auto}
+@media (hover:none) and (pointer:coarse){.scan-pair{flex-direction:column;align-items:stretch;gap:12px}.scan-pair .scan{width:100%}.qr-label{display:none}}
+"#;
+
 /// Padlock glyph shown at the QR center (decorative; QR uses high error correction so it stays
 /// scannable under the badge).
 const LOCK_SVG: &str = r##"<svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M8 10V7a4 4 0 0 1 8 0v3" stroke="#fff" stroke-width="2" stroke-linecap="round"/><rect x="5.5" y="10" width="13" height="9.5" rx="2.5" fill="#fff"/></svg>"##;
@@ -178,39 +197,46 @@ const RING_LOGO_SVG: &str = r##"<svg viewBox="0 0 146.88 32.0036" fill="none" ar
 /// KeyRound glyph inside the mobile authorize button (Figma "Icon / KeyRound", lucide key-round).
 const KEY_ICON_SVG: &str = r##"<svg viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M1.33333 11.9999V13.9999C1.33333 14.3999 1.6 14.6666 2 14.6666H4.66667V12.6666H6.66667V10.6666H8L8.93333 9.73328C9.85989 10.056 10.8686 10.0548 11.7943 9.72978C12.7201 9.40475 13.5081 8.77517 14.0296 7.94403C14.551 7.11289 14.7749 6.12939 14.6647 5.15444C14.5545 4.17948 14.1167 3.27078 13.423 2.57699C12.7292 1.8832 11.8205 1.4454 10.8455 1.3352C9.87055 1.22501 8.88706 1.44894 8.05592 1.97037C7.22478 2.4918 6.59519 3.27986 6.27017 4.20562C5.94514 5.13139 5.9439 6.14005 6.26667 7.06661L1.33333 11.9999Z" stroke="currentColor" stroke-width="1.33" stroke-linecap="round" stroke-linejoin="round"/><path d="M11 5.33333C11.1841 5.33333 11.3333 5.18409 11.3333 5C11.3333 4.8159 11.1841 4.66667 11 4.66667C10.8159 4.66667 10.6667 4.8159 10.6667 5C10.6667 5.18409 10.8159 5.33333 11 5.33333Z" stroke="currentColor" stroke-width="1.33" stroke-linecap="round" stroke-linejoin="round"/></svg>"##;
 
-fn render_connect_shell_html(
+pub(super) fn render_connect_shell_html(
     flow_id: &str,
     authorization_url: &str,
+    grant_authorization_url: Option<&str>,
     delivery: ConnectDeliveryMode,
     target_origin: &str,
     callback_state: &str,
 ) -> String {
     let escaped_flow_id = escape_html(flow_id);
-    let escaped_authorization_url = escape_html(authorization_url);
-    let qr_svg = render_authorization_qr_svg(authorization_url);
-    // Desktop: a plain (non-interactive) QR to scan from a separate device. Touch devices swap it for
-    // the Authorize deep-link button below — the same-device deep link lives only on that button, so
-    // the QR itself is not a link (per the team decision: desktop QR is scan-only).
-    let scan = format!(
-        r#"<div class="scan">
-      <span class="qr" data-testid="pubky-auth-qr">
-        {qr_svg}
-        <span class="qr-badge">{LOCK_SVG}</span>
-      </span>
-      <span class="ring-logo" aria-hidden="true">{RING_LOGO_SVG}</span>
-      <a class="authorize-btn" href="{escaped_authorization_url}">
-        {KEY_ICON_SVG}
-        <span>Continue with Pubky Ring</span>
-      </a>
-      <span class="caption">LOCKS.PUBKY.APP</span>
+    let (signers, scan_pair_css) = match grant_authorization_url {
+        Some(_) => (
+            "<strong>Pubky Ring</strong> or <strong>Bitkit</strong>",
+            SCAN_PAIR_CSS,
+        ),
+        None => ("<strong>Pubky Ring</strong>", ""),
+    };
+    let ring_scan = render_ring_scan_html(authorization_url);
+    let scan = match grant_authorization_url {
+        Some(grant_authorization_url) => {
+            let ring_scan = ring_scan.replacen(
+                r#"<div class="scan">"#,
+                r#"<div class="scan"><span class="qr-label">Approve in Pubky Ring</span>"#,
+                1,
+            );
+            let bitkit_scan = render_bitkit_scan_html(grant_authorization_url);
+            format!(
+                r#"<div class="scan-pair">
+    {ring_scan}
+    {bitkit_scan}
     </div>"#
-    );
+            )
+        }
+        None => ring_scan,
+    };
     let head = format!(
         r#"<head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Enable Locks</title>
-  <style>{SHELL_CSS}</style>
+  <style>{SHELL_CSS}{scan_pair_css}</style>
 </head>"#
     );
     match delivery {
@@ -236,7 +262,7 @@ fn render_connect_shell_html(
 <body>
   <main class="card">
     <h1 class="title">Enable Locks</h1>
-    <p class="desc">Use <strong>Pubky Ring</strong> to authorize Locks server to manage your Locks data.</p>
+    <p class="desc">Use {signers} to authorize Locks server to manage your Locks data.</p>
     {scan}
     <form method="post" action="/connect/{escaped_flow_id}/complete">
       <button class="approve-btn" type="submit">I approved this connection</button>
@@ -246,6 +272,49 @@ fn render_connect_shell_html(
 </html>"#
         ),
     }
+}
+
+/// Pubky Ring cookie QR. Byte-for-byte the single-QR shell markup, so a Lock Server without
+/// grant connect renders exactly what it rendered before.
+pub(super) fn render_ring_scan_html(authorization_url: &str) -> String {
+    let escaped_authorization_url = escape_html(authorization_url);
+    let qr_svg = render_authorization_qr_svg(authorization_url);
+    // Desktop: a plain (non-interactive) QR to scan from a separate device. Touch devices swap it for
+    // the Authorize deep-link button below — the same-device deep link lives only on that button, so
+    // the QR itself is not a link (per the team decision: desktop QR is scan-only).
+    format!(
+        r#"<div class="scan">
+      <span class="qr" data-testid="pubky-auth-qr">
+        {qr_svg}
+        <span class="qr-badge">{LOCK_SVG}</span>
+      </span>
+      <span class="ring-logo" aria-hidden="true">{RING_LOGO_SVG}</span>
+      <a class="authorize-btn" href="{escaped_authorization_url}">
+        {KEY_ICON_SVG}
+        <span>Continue with Pubky Ring</span>
+      </a>
+      <span class="caption">LOCKS.PUBKY.APP</span>
+    </div>"#
+    )
+}
+
+/// Bitkit grant QR (`pubkyauth://signin_grant`). Bitkit 2.5+ accepts only grant URLs.
+fn render_bitkit_scan_html(grant_authorization_url: &str) -> String {
+    let escaped_grant_authorization_url = escape_html(grant_authorization_url);
+    let qr_svg = render_authorization_qr_svg(grant_authorization_url);
+    format!(
+        r#"<div class="scan">
+      <span class="qr-label">Approve in Bitkit</span>
+      <span class="qr" data-testid="bitkit-grant-qr">
+        {qr_svg}
+        <span class="qr-badge">{LOCK_SVG}</span>
+      </span>
+      <a class="authorize-btn" data-testid="bitkit-grant-authorize" href="{escaped_grant_authorization_url}">
+        {KEY_ICON_SVG}
+        <span>Continue with Bitkit</span>
+      </a>
+    </div>"#
+    )
 }
 
 /// Shell JS for postmessage delivery. Long-polls `POST /complete` (the server blocks until Ring
@@ -340,7 +409,7 @@ fn js_string_literal(value: &str) -> String {
         .replace('>', "\\u003e")
 }
 
-fn render_authorization_qr_svg(authorization_url: &str) -> String {
+pub(super) fn render_authorization_qr_svg(authorization_url: &str) -> String {
     // High error correction (~30% recovery) so the centered brand badge does not break scanning.
     QrCode::with_error_correction_level(authorization_url.as_bytes(), qrcode::EcLevel::H)
         .expect("legacy Pubky authorization URL fits QR capacity")
@@ -401,6 +470,9 @@ pub(super) async fn connect_shell_complete(
         state.creator_authorities().as_ref(),
         state.frontend_session_codes().as_ref(),
         state.legacy_creator_connect_flow_client().as_ref(),
+        state
+            .grant_creator_connect_flow_client()
+            .map(|client| client.as_ref()),
         state.frontend_session_code_generator().as_ref(),
         state.clock().as_ref(),
         CompleteCreatorConnectFlowRequest {

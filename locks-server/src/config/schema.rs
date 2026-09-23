@@ -123,11 +123,20 @@ pub struct CreatorAuthorityAcquisitionConfig {
     pub frontend_session_ttl_seconds: u64,
     pub frontend_session_code_ttl_seconds: u64,
     pub legacy_connect: LegacyConnectAcquisitionConfig,
+    /// Offers a Bitkit-compatible `signin_grant` QR beside the legacy cookie QR when set.
+    pub grant_connect: Option<GrantConnectAcquisitionConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LegacyConnectAcquisitionConfig {
     pub allowed_return_origins: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrantConnectAcquisitionConfig {
+    /// Grant `client_id`: the Lock Server's public hostname. Display identity for the
+    /// signer only; `allowed_return_origins` stays the return gate.
+    pub client_id: String,
 }
 
 impl Default for CreatorAuthorityAcquisitionConfig {
@@ -140,6 +149,7 @@ impl Default for CreatorAuthorityAcquisitionConfig {
             legacy_connect: LegacyConnectAcquisitionConfig {
                 allowed_return_origins: Vec::new(),
             },
+            grant_connect: None,
         }
     }
 }
@@ -330,6 +340,10 @@ pub enum ConfigError {
         "creator_authority_acquisition.allowed_return_origins must not be \"*\" when runtime.environment is production; list explicit origins"
     )]
     WildcardReturnOriginInProduction,
+    #[error(
+        "creator_authority_acquisition.grant_connect.client_id must be a hostname with an optional port, without scheme, path, query, or fragment: {0}"
+    )]
+    InvalidGrantConnectClientId(String),
     #[error("pubky.pkarr_relays must contain at least one relay when configured")]
     EmptyPubkyPkarrRelays,
     #[error(

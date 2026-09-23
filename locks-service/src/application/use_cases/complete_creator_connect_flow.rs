@@ -42,6 +42,7 @@ pub struct CompleteCreatorConnectFlowResponse {
 /// A flow started with a grant URL waits for both approvals and completes with the first
 /// one that succeeds. A cookie approval stores a `LegacyCookie` record; a grant approval
 /// stores a `Grant` record holding delegated restore state.
+#[allow(clippy::too_many_arguments)]
 pub async fn complete_creator_connect_flow(
     flow_store: &dyn CreatorConnectFlowStore,
     authority_store: &dyn CreatorAuthorityStore,

@@ -19,10 +19,10 @@ use locks_core::lock_policy::{
 use locks_core::verification::{Proof, SUBMITTED_PROOF_BUNDLE_VERSION, SubmittedProofBundle};
 use locks_service::application::errors::ApplicationError;
 use locks_service::application::models::{
-    CreatorAuthorityAuthKind, CreatorAuthorityRecord, CreatorAuthoritySecret,
-    CreatorConnectAuthorizationUrl, CreatorConnectFlowId, FrontendSessionRecord,
-    FrontendSessionToken, GrantCreatorConnectFlowApproval, GrantPopKeyId, GuardedResourceRecord,
-    LegacyCreatorConnectFlowApproval, PendingCreatorConnectFlowRecord,
+    CreatorAuthorityAuthKind, CreatorAuthorityCheckOutcome, CreatorAuthorityRecord,
+    CreatorAuthoritySecret, CreatorConnectAuthorizationUrl, CreatorConnectFlowId,
+    FrontendSessionRecord, FrontendSessionToken, GrantCreatorConnectFlowApproval, GrantPopKeyId,
+    GuardedResourceRecord, LegacyCreatorConnectFlowApproval, PendingCreatorConnectFlowRecord,
 };
 use locks_service::application::ports::{
     Clock, GrantCreatorConnectFlowClient, LegacyCreatorConnectFlowClient,
@@ -2478,8 +2478,8 @@ async fn public_creator_authority_status_route_reports_stored_authority_without_
 #[tokio::test]
 async fn public_creator_authority_status_route_reports_a_stored_row_the_server_cannot_use_as_not_authorized()
  {
-    // This state's manager refuses grant records (no grant PoP keys), exactly as the
-    // content and payment paths would for this row.
+    // An expired grant, which this state's manager also refuses (no grant PoP keys), exactly
+    // as the content and payment paths would.
     let state = test_state();
     state
         .creator_authorities()
@@ -2522,6 +2522,68 @@ async fn public_creator_authority_status_route_reports_a_stored_row_the_server_c
             "authorized": false,
         })
     );
+}
+
+#[tokio::test]
+async fn public_creator_authority_status_route_answers_a_recorded_refusal_without_revalidating() {
+    // This state's cookie revalidator honors every secret, so only the stored refusal can
+    // make this false: the anonymous route must not run a real check of its own.
+    let state = test_state();
+    seed_creator_authority(&state).await;
+    state
+        .creator_authorities()
+        .record_creator_authority_check(
+            &creator(),
+            CreatorAuthorityCheckOutcome::Refused,
+            time::OffsetDateTime::now_utc(),
+        )
+        .await
+        .unwrap();
+    let app = router(state);
+
+    let response = app
+        .oneshot(empty_request(
+            "GET",
+            "/creators/pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/authority-status",
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response_json(response).await["authorized"], false);
+}
+
+#[tokio::test]
+async fn creator_authority_status_route_reports_an_expired_grant_as_not_authorized() {
+    let state = test_state();
+    seed_frontend_session(&state, "frontend-session-token", creator()).await;
+    state
+        .creator_authorities()
+        .upsert_creator_authority(CreatorAuthorityRecord {
+            creator: creator(),
+            auth_kind: CreatorAuthorityAuthKind::Grant,
+            granted_scopes: vec!["/pub/locks.app/:rw".to_owned()],
+            secret: CreatorAuthoritySecret::new("grant-restore-state"),
+            session_expires_at: Some(time::OffsetDateTime::now_utc() - time::Duration::days(1)),
+            last_revalidated_at: None,
+        })
+        .await
+        .unwrap();
+    let app = router(state);
+
+    let response = app
+        .oneshot(auth_request(
+            "GET",
+            "/creator/authority-status",
+            "Bearer frontend-session-token",
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await;
+    assert_eq!(body["authorized"], false);
+    assert_eq!(body["auth_kind"], Value::Null);
 }
 
 #[tokio::test]

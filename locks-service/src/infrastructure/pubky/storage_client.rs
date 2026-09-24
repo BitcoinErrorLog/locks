@@ -611,7 +611,8 @@ mod tests {
     };
     use crate::application::errors::ApplicationError;
     use crate::application::models::{
-        CreatorAuthorityAuthKind, CreatorAuthorityRecord, CreatorAuthoritySecret,
+        CreatorAuthorityAuthKind, CreatorAuthorityCheckOutcome, CreatorAuthorityRecord,
+        CreatorAuthoritySecret, CreatorAuthorityValidity,
     };
     use crate::application::ports::{
         CreatorAuthorityManager, CreatorAuthorityStatus, CreatorAuthorityStore,
@@ -1097,11 +1098,15 @@ mod tests {
     #[derive(Debug)]
     struct FakeCreatorAuthorityStore {
         record: Option<CreatorAuthorityRecord>,
+        checks: Mutex<Vec<CreatorAuthorityCheckOutcome>>,
     }
 
     impl FakeCreatorAuthorityStore {
         fn new(record: Option<CreatorAuthorityRecord>) -> Self {
-            Self { record }
+            Self {
+                record,
+                checks: Mutex::new(Vec::new()),
+            }
         }
     }
 
@@ -1123,6 +1128,27 @@ mod tests {
                 .as_ref()
                 .filter(|record| &record.creator == creator)
                 .cloned())
+        }
+
+        async fn get_creator_authority_validity(
+            &self,
+            creator: &CreatorPubky,
+        ) -> Result<Option<CreatorAuthorityValidity>, ApplicationError> {
+            Ok(self
+                .record
+                .as_ref()
+                .filter(|record| &record.creator == creator)
+                .map(|record| CreatorAuthorityValidity::from_record(record, None)))
+        }
+
+        async fn record_creator_authority_check(
+            &self,
+            _creator: &CreatorPubky,
+            outcome: CreatorAuthorityCheckOutcome,
+            _checked_at: time::OffsetDateTime,
+        ) -> Result<(), ApplicationError> {
+            self.checks.lock().unwrap().push(outcome);
+            Ok(())
         }
 
         async fn delete_creator_authority(

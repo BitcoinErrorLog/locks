@@ -3,10 +3,11 @@ use locks_core::ids::CreatorPubky;
 
 use crate::application::errors::ApplicationError;
 use crate::application::models::{
-    CreatorAuthorityAuthKind, CreatorAuthorityRecord, CreatorConnectAuthorizationUrl,
-    CreatorConnectFlowId, FrontendSessionCode, FrontendSessionCodeRecord, FrontendSessionRecord,
-    FrontendSessionToken, GrantCreatorConnectFlowApproval, GrantPopKeyId,
-    LegacyCreatorConnectFlowApproval, PendingCreatorConnectFlowRecord,
+    CreatorAuthorityAuthKind, CreatorAuthorityCheckOutcome, CreatorAuthorityRecord,
+    CreatorAuthorityValidity, CreatorConnectAuthorizationUrl, CreatorConnectFlowId,
+    FrontendSessionCode, FrontendSessionCodeRecord, FrontendSessionRecord, FrontendSessionToken,
+    GrantCreatorConnectFlowApproval, GrantPopKeyId, LegacyCreatorConnectFlowApproval,
+    PendingCreatorConnectFlowRecord,
 };
 
 /// Secret-free status view for creator-granted homeserver authority.
@@ -40,6 +41,23 @@ pub trait CreatorAuthorityStore: Send + Sync {
         &self,
         creator: &CreatorPubky,
     ) -> Result<Option<CreatorAuthorityRecord>, ApplicationError>;
+
+    /// Loads the secret-free validity state without reading or decrypting the secret.
+    ///
+    /// Returns `Ok(None)` when the creator has no stored authority on this Lock Server.
+    async fn get_creator_authority_validity(
+        &self,
+        creator: &CreatorPubky,
+    ) -> Result<Option<CreatorAuthorityValidity>, ApplicationError>;
+
+    /// Records the outcome of a real revalidation. `Honored` sets `last_revalidated_at` and
+    /// clears `refused_at`; `Refused` sets `refused_at`. A missing record is left missing.
+    async fn record_creator_authority_check(
+        &self,
+        creator: &CreatorPubky,
+        outcome: CreatorAuthorityCheckOutcome,
+        checked_at: time::OffsetDateTime,
+    ) -> Result<(), ApplicationError>;
 
     /// Ensures the creator authority record is absent.
     async fn delete_creator_authority(

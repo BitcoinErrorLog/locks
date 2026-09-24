@@ -85,6 +85,14 @@ pub enum ApplicationError {
         /// Secret-free creator authority failure detail.
         message: String,
     },
+    /// The creator's homeserver definitively refused the stored cookie session or grant
+    /// (revoked, expired, or bound to another key). Recorded as a refusal.
+    #[error("creator authority refused")]
+    CreatorAuthorityRefused,
+    /// The creator's homeserver could not be reached to revalidate authority (transport
+    /// failure, 5xx, 429, or DHT resolution). Says nothing about the authority's validity.
+    #[error("creator authority check unavailable")]
+    CreatorAuthorityCheckUnavailable,
     /// Creator authority record contains an unsupported auth kind.
     #[error("invalid creator authority auth kind: {auth_kind}")]
     InvalidCreatorAuthorityAuthKind {

@@ -186,10 +186,11 @@ mod tests {
 
     use crate::application::errors::ApplicationError;
     use crate::application::models::{
-        CreatorAuthorityAuthKind, CreatorAuthorityRecord, CreatorAuthoritySecret,
-        CreatorConnectAuthorizationUrl, CreatorConnectFlowId, FrontendSessionCode,
-        FrontendSessionCodeRecord, GrantCreatorConnectFlowApproval, GrantPopKeyId,
-        LegacyCreatorConnectFlowApproval, PendingCreatorConnectFlowRecord,
+        CreatorAuthorityAuthKind, CreatorAuthorityCheckOutcome, CreatorAuthorityRecord,
+        CreatorAuthoritySecret, CreatorAuthorityValidity, CreatorConnectAuthorizationUrl,
+        CreatorConnectFlowId, FrontendSessionCode, FrontendSessionCodeRecord,
+        GrantCreatorConnectFlowApproval, GrantPopKeyId, LegacyCreatorConnectFlowApproval,
+        PendingCreatorConnectFlowRecord,
     };
     use crate::application::ports::{
         Clock, CreatorAuthorityStore, CreatorConnectFlowStore, FrontendSessionCodeGenerator,
@@ -667,6 +668,24 @@ mod tests {
         ) -> Result<(), ApplicationError> {
             *self.record.lock().unwrap() = Some(record);
             Ok(())
+        }
+
+        async fn get_creator_authority_validity(
+            &self,
+            _creator: &CreatorPubky,
+        ) -> Result<Option<CreatorAuthorityValidity>, ApplicationError> {
+            Ok(self
+                .record()
+                .map(|record| CreatorAuthorityValidity::from_record(&record, None)))
+        }
+
+        async fn record_creator_authority_check(
+            &self,
+            _creator: &CreatorPubky,
+            _outcome: CreatorAuthorityCheckOutcome,
+            _checked_at: OffsetDateTime,
+        ) -> Result<(), ApplicationError> {
+            unimplemented!("connect-flow completion never revalidates")
         }
 
         async fn delete_creator_authority(

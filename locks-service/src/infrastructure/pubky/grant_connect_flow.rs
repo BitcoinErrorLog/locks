@@ -23,6 +23,7 @@ use crate::application::ports::GrantCreatorConnectFlowClient;
 use crate::infrastructure::pubky::legacy_connect_flow::{
     creator_from_pubky_public_key_z32, requested_scopes_to_capabilities,
 };
+use crate::infrastructure::pubky::legacy_creator_authority::classify_homeserver_restore_error;
 
 /// BLAKE3 `derive_key` context for Lock Server grant PoP keys. Changing it orphans every
 /// stored grant authority.
@@ -329,7 +330,7 @@ pub async fn restore_grant_session(
     let credential =
         GrantCredential::import_delegated_state(state, client, pop_keys.signer(&key_id))
             .await
-            .map_err(|_| grant_restore_error())?;
+            .map_err(|error| classify_homeserver_restore_error(&error, grant_restore_error))?;
     Ok(PubkySession::from_grant_credential(
         client.clone(),
         credential,
@@ -346,7 +347,7 @@ pub async fn restore_grant_session_for_creator(
     let session = restore_grant_session(client, pop_keys, secret).await?;
     let restored = creator_from_pubky_public_key_z32(&session.public_key().z32())?;
     if &restored != creator {
-        return Err(ApplicationError::CreatorAuthorityUnavailable);
+        return Err(ApplicationError::CreatorAuthorityRefused);
     }
     Ok(session)
 }

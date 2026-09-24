@@ -157,6 +157,8 @@ impl From<ApplicationError> for ApiError {
             ),
             ApplicationError::CreatorAuthorityUnavailable
             | ApplicationError::CreatorAuthoritySecret { .. }
+            | ApplicationError::CreatorAuthorityRefused
+            | ApplicationError::CreatorAuthorityCheckUnavailable
             | ApplicationError::InvalidCreatorAuthorityAuthKind { .. } => Self::new(
                 ApiErrorCode::CreatorAuthorityUnavailable,
                 "creator authority unavailable",

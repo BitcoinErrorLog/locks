@@ -41,6 +41,7 @@ pub(super) async fn creator_authority_status_route(
     let status = get_creator_authority_status(
         state.frontend_sessions().as_ref(),
         state.creator_authorities().as_ref(),
+        state.creator_authority_manager().as_ref(),
         state.clock().as_ref(),
         GetCreatorAuthorityStatusRequest { session_token },
     )
@@ -55,11 +56,14 @@ pub(super) async fn public_creator_authority_status_route(
 ) -> Result<Response, ApiError> {
     let creator = CreatorPubky::from_str(&creator)
         .map_err(|_| ApiError::new(ApiErrorCode::InvalidIdentifier, "invalid creator"))?;
-    let status =
-        get_public_creator_authority_status(state.creator_authority_manager().as_ref(), creator)
-            .await?;
+    let status = get_public_creator_authority_status(
+        state.creator_authorities().as_ref(),
+        state.clock().as_ref(),
+        creator,
+    )
+    .await?;
 
-    // Revocation must show on the next read; no shared cache may replay an old answer.
+    // A recorded refusal must show on the next read; no shared cache may replay an old answer.
     Ok((
         [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))],
         Json(PublicCreatorAuthorityStatusHttpResponse::from(status)),

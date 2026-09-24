@@ -93,6 +93,58 @@ impl fmt::Debug for CreatorAuthorityRecord {
     }
 }
 
+/// Secret-free validity state of a stored creator authority, read without the secret.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreatorAuthorityValidity {
+    /// Creator whose homeserver authority is represented.
+    pub creator: CreatorPubky,
+    /// Auth mechanism used by the stored secret.
+    pub auth_kind: CreatorAuthorityAuthKind,
+    /// Scopes granted to the Lock Server.
+    pub granted_scopes: Vec<String>,
+    /// Optional session or grant expiration reported by the underlying auth mechanism.
+    pub session_expires_at: Option<OffsetDateTime>,
+    /// Last time a real revalidation succeeded.
+    pub last_revalidated_at: Option<OffsetDateTime>,
+    /// Time of the last real revalidation the homeserver refused, if no later one succeeded.
+    pub refused_at: Option<OffsetDateTime>,
+}
+
+impl CreatorAuthorityValidity {
+    /// Secret-free validity view of `record`, for stores that keep whole records in memory.
+    pub fn from_record(
+        record: &CreatorAuthorityRecord,
+        refused_at: Option<OffsetDateTime>,
+    ) -> Self {
+        Self {
+            creator: record.creator.clone(),
+            auth_kind: record.auth_kind,
+            granted_scopes: record.granted_scopes.clone(),
+            session_expires_at: record.session_expires_at,
+            last_revalidated_at: record.last_revalidated_at,
+            refused_at,
+        }
+    }
+
+    /// The one rule both authority-status routes answer with: the last real check was not
+    /// refused, and any reported expiry is still in the future.
+    pub fn is_usable_at(&self, now: OffsetDateTime) -> bool {
+        self.refused_at.is_none()
+            && self
+                .session_expires_at
+                .is_none_or(|expires_at| expires_at > now)
+    }
+}
+
+/// Outcome of a real revalidation against the creator's homeserver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CreatorAuthorityCheckOutcome {
+    /// The homeserver honored the stored cookie session or grant.
+    Honored,
+    /// The homeserver definitively refused it (revoked, expired, or not restorable).
+    Refused,
+}
+
 /// Approved legacy Pubky auth-flow material, converted to Locks creator-authority state.
 #[derive(Clone, PartialEq, Eq)]
 pub struct LegacyCreatorConnectFlowApproval {

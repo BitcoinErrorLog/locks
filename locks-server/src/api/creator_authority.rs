@@ -52,13 +52,19 @@ pub(super) async fn creator_authority_status_route(
 pub(super) async fn public_creator_authority_status_route(
     State(state): State<AppState>,
     Path(creator): Path<String>,
-) -> Result<Json<PublicCreatorAuthorityStatusHttpResponse>, ApiError> {
+) -> Result<Response, ApiError> {
     let creator = CreatorPubky::from_str(&creator)
         .map_err(|_| ApiError::new(ApiErrorCode::InvalidIdentifier, "invalid creator"))?;
     let status =
-        get_public_creator_authority_status(state.creator_authorities().as_ref(), creator).await?;
+        get_public_creator_authority_status(state.creator_authority_manager().as_ref(), creator)
+            .await?;
 
-    Ok(Json(PublicCreatorAuthorityStatusHttpResponse::from(status)))
+    // Revocation must show on the next read; no shared cache may replay an old answer.
+    Ok((
+        [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))],
+        Json(PublicCreatorAuthorityStatusHttpResponse::from(status)),
+    )
+        .into_response())
 }
 
 /// Postmessage message `type` published to embedding apps. Embedders MUST validate this string.

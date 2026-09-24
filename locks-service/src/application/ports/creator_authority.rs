@@ -41,15 +41,6 @@ pub trait CreatorAuthorityStore: Send + Sync {
         creator: &CreatorPubky,
     ) -> Result<Option<CreatorAuthorityRecord>, ApplicationError>;
 
-    /// Reports whether a creator authority record exists, without loading or decrypting its
-    /// secret. Stores that can answer from an index should override this.
-    async fn has_creator_authority(
-        &self,
-        creator: &CreatorPubky,
-    ) -> Result<bool, ApplicationError> {
-        Ok(self.get_creator_authority(creator).await?.is_some())
-    }
-
     /// Ensures the creator authority record is absent.
     async fn delete_creator_authority(
         &self,

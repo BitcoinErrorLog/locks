@@ -4,7 +4,9 @@ use locks_core::ids::CreatorPubky;
 
 use crate::application::errors::ApplicationError;
 use crate::application::models::{CreatorAuthorityAuthKind, FrontendSessionToken};
-use crate::application::ports::{Clock, CreatorAuthorityStore, FrontendSessionStore};
+use crate::application::ports::{
+    Clock, CreatorAuthorityManager, CreatorAuthorityStore, FrontendSessionStore,
+};
 
 /// Request for secret-free creator authority status from authenticated frontend context.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,23 +71,40 @@ pub async fn get_creator_authority_status(
 
 /// Creator-keyed status that carries no session, auth kind, scopes, or expiry.
 ///
-/// Callers learn only whether this Lock Server holds authority for `creator`, so a
-/// seller UI can show the connection after its frontend session has expired or its
-/// browser storage was cleared, without asking the creator to approve again.
+/// Callers learn only whether this Lock Server can use creator authority for `creator`
+/// right now, so a seller UI can show the connection after its frontend session has
+/// expired or its browser storage was cleared, without asking the creator to approve again.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublicCreatorAuthorityStatusView {
     /// Creator identity from the request path, in canonical form.
     pub creator: CreatorPubky,
-    /// Whether this Lock Server currently has stored creator authority.
+    /// Whether the stored authority passes the same revalidation the Lock Server runs
+    /// before Pubky homeserver I/O.
     pub authorized: bool,
 }
 
-/// Returns whether this Lock Server holds creator authority, without a frontend session.
+/// Returns whether this Lock Server holds usable creator authority, without a frontend session.
+///
+/// Usable means exactly what [`CreatorAuthorityManager::require_creator_authority`] accepts
+/// before content, entitlement, and payment-path homeserver I/O: a stored record whose
+/// cookie session or grant the creator's homeserver still honors. A missing, revoked,
+/// expired, or unrestorable record reports `authorized: false`. Storage and other internal
+/// failures are errors, not `false`.
 pub async fn get_public_creator_authority_status(
-    creator_authorities: &dyn CreatorAuthorityStore,
+    creator_authority_manager: &dyn CreatorAuthorityManager,
     creator: CreatorPubky,
 ) -> Result<PublicCreatorAuthorityStatusView, ApplicationError> {
-    let authorized = creator_authorities.has_creator_authority(&creator).await?;
+    let authorized = match creator_authority_manager
+        .require_creator_authority(&creator)
+        .await
+    {
+        Ok(status) => status.authorized && status.creator == creator,
+        Err(
+            ApplicationError::CreatorAuthorityUnavailable
+            | ApplicationError::CreatorAuthoritySecret { .. },
+        ) => false,
+        Err(error) => return Err(error),
+    };
     Ok(PublicCreatorAuthorityStatusView {
         creator,
         authorized,
@@ -110,7 +129,13 @@ mod tests {
         CreatorAuthorityAuthKind, CreatorAuthorityRecord, CreatorAuthoritySecret,
         FrontendSessionRecord, FrontendSessionToken,
     };
-    use crate::application::ports::{Clock, CreatorAuthorityStore, FrontendSessionStore};
+    use crate::application::ports::{
+        Clock, CreatorAuthorityManager, CreatorAuthorityStore, FrontendSessionStore,
+    };
+    use crate::infrastructure::pubky::legacy_creator_authority::{
+        GrantCredentialRevalidator, LegacyCookieCreatorAuthorityManager,
+        LegacyCookieSessionRevalidator,
+    };
 
     #[tokio::test]
     async fn get_creator_authority_status_returns_unauthorized_when_frontend_session_is_missing_or_expired()
@@ -214,29 +239,182 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn public_creator_authority_status_reports_presence_without_a_frontend_session() {
-        let missing = get_public_creator_authority_status(&AuthorityStore::default(), creator())
-            .await
-            .unwrap();
-        assert_eq!(missing.creator, creator());
-        assert!(!missing.authorized);
-
-        let present = get_public_creator_authority_status(
-            &AuthorityStore::with_record(CreatorAuthorityRecord {
-                creator: creator(),
-                auth_kind: CreatorAuthorityAuthKind::LegacyCookie,
-                granted_scopes: vec!["/pub/locks.app/:rw".to_owned()],
-                secret: CreatorAuthoritySecret::new("creator-authority-secret"),
-                session_expires_at: None,
-                last_revalidated_at: None,
-            }),
+    async fn public_status_is_authorized_only_when_the_homeserver_still_honors_the_cookie() {
+        let usable = get_public_creator_authority_status(
+            &manager(
+                AuthorityStore::with_record(cookie_record()),
+                HomeserverAnswer::Honored,
+                HomeserverAnswer::Honored,
+            ),
             creator(),
         )
         .await
         .unwrap();
-        assert_eq!(present.creator, creator());
-        assert!(present.authorized);
-        assert!(!format!("{present:?}").contains("creator-authority-secret"));
+        assert_eq!(usable.creator, creator());
+        assert!(usable.authorized);
+        assert!(!format!("{usable:?}").contains("creator-authority-secret"));
+
+        let missing = get_public_creator_authority_status(
+            &manager(
+                AuthorityStore::default(),
+                HomeserverAnswer::Honored,
+                HomeserverAnswer::Honored,
+            ),
+            creator(),
+        )
+        .await
+        .unwrap();
+        assert!(!missing.authorized);
+    }
+
+    #[tokio::test]
+    async fn public_status_reports_a_revoked_cookie_row_as_not_authorized() {
+        let status = get_public_creator_authority_status(
+            &manager(
+                AuthorityStore::with_record(cookie_record()),
+                HomeserverAnswer::Refused,
+                HomeserverAnswer::Honored,
+            ),
+            creator(),
+        )
+        .await
+        .unwrap();
+
+        assert!(!status.authorized);
+    }
+
+    #[tokio::test]
+    async fn public_status_reports_an_expired_grant_row_as_not_authorized() {
+        let expired_grant = CreatorAuthorityRecord {
+            auth_kind: CreatorAuthorityAuthKind::Grant,
+            session_expires_at: Some(OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap()),
+            ..cookie_record()
+        };
+
+        let status = get_public_creator_authority_status(
+            &manager(
+                AuthorityStore::with_record(expired_grant),
+                HomeserverAnswer::Honored,
+                HomeserverAnswer::Refused,
+            ),
+            creator(),
+        )
+        .await
+        .unwrap();
+
+        assert!(!status.authorized);
+    }
+
+    #[tokio::test]
+    async fn public_status_surfaces_storage_failures_instead_of_reporting_not_authorized() {
+        let error = get_public_creator_authority_status(
+            &LegacyCookieCreatorAuthorityManager::new(
+                FailingAuthorityStore,
+                CookieHomeserver(HomeserverAnswer::Honored),
+            ),
+            creator(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, ApplicationError::Storage { .. }));
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum HomeserverAnswer {
+        Honored,
+        Refused,
+    }
+
+    impl HomeserverAnswer {
+        fn result(self, message: &str) -> Result<(), ApplicationError> {
+            match self {
+                Self::Honored => Ok(()),
+                Self::Refused => Err(ApplicationError::CreatorAuthoritySecret {
+                    message: message.to_owned(),
+                }),
+            }
+        }
+    }
+
+    /// Stands in for the homeserver's answer to a cookie-session restore.
+    struct CookieHomeserver(HomeserverAnswer);
+
+    #[async_trait]
+    impl LegacyCookieSessionRevalidator for CookieHomeserver {
+        async fn revalidate_legacy_cookie_secret(
+            &self,
+            _secret: &CreatorAuthoritySecret,
+        ) -> Result<(), ApplicationError> {
+            self.0
+                .result("failed to restore legacy creator authority secret")
+        }
+    }
+
+    /// Stands in for the homeserver's answer to a delegated grant restore.
+    struct GrantHomeserver(HomeserverAnswer);
+
+    #[async_trait]
+    impl GrantCredentialRevalidator for GrantHomeserver {
+        async fn revalidate_grant_credential(
+            &self,
+            _creator: &CreatorPubky,
+            _secret: &CreatorAuthoritySecret,
+        ) -> Result<(), ApplicationError> {
+            self.0.result("failed to restore grant creator authority")
+        }
+    }
+
+    fn manager(
+        store: AuthorityStore,
+        cookie: HomeserverAnswer,
+        grant: HomeserverAnswer,
+    ) -> impl CreatorAuthorityManager {
+        LegacyCookieCreatorAuthorityManager::new(store, CookieHomeserver(cookie))
+            .with_grant_revalidator(GrantHomeserver(grant))
+    }
+
+    fn cookie_record() -> CreatorAuthorityRecord {
+        CreatorAuthorityRecord {
+            creator: creator(),
+            auth_kind: CreatorAuthorityAuthKind::LegacyCookie,
+            granted_scopes: vec!["/pub/locks.app/:rw".to_owned()],
+            secret: CreatorAuthoritySecret::new("creator-authority-secret"),
+            session_expires_at: None,
+            last_revalidated_at: None,
+        }
+    }
+
+    struct FailingAuthorityStore;
+
+    #[async_trait]
+    impl CreatorAuthorityStore for FailingAuthorityStore {
+        async fn upsert_creator_authority(
+            &self,
+            _authority: CreatorAuthorityRecord,
+        ) -> Result<(), ApplicationError> {
+            Err(storage_failure())
+        }
+
+        async fn get_creator_authority(
+            &self,
+            _creator: &CreatorPubky,
+        ) -> Result<Option<CreatorAuthorityRecord>, ApplicationError> {
+            Err(storage_failure())
+        }
+
+        async fn delete_creator_authority(
+            &self,
+            _creator: &CreatorPubky,
+        ) -> Result<(), ApplicationError> {
+            Err(storage_failure())
+        }
+    }
+
+    fn storage_failure() -> ApplicationError {
+        ApplicationError::Storage {
+            message: "connection refused".to_owned(),
+        }
     }
 
     fn session_record(now: OffsetDateTime) -> FrontendSessionRecord {

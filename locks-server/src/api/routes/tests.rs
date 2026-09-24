@@ -2443,6 +2443,10 @@ async fn public_creator_authority_status_route_reports_stored_authority_without_
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(header::CACHE_CONTROL).unwrap(),
+        "no-store"
+    );
     let body = response_json(response).await;
     assert_eq!(
         body,
@@ -2466,6 +2470,55 @@ async fn public_creator_authority_status_route_reports_stored_authority_without_
         response_json(other).await,
         json!({
             "creator": "pubkyorhzqdiexwmi6iidktucgud63ufa5nwtsuzdxe176a8izd6jsqky",
+            "authorized": false,
+        })
+    );
+}
+
+#[tokio::test]
+async fn public_creator_authority_status_route_reports_a_stored_row_the_server_cannot_use_as_not_authorized()
+ {
+    // This state's manager refuses grant records (no grant PoP keys), exactly as the
+    // content and payment paths would for this row.
+    let state = test_state();
+    state
+        .creator_authorities()
+        .upsert_creator_authority(CreatorAuthorityRecord {
+            creator: creator(),
+            auth_kind: CreatorAuthorityAuthKind::Grant,
+            granted_scopes: vec!["/pub/locks.app/:rw".to_owned()],
+            secret: CreatorAuthoritySecret::new("grant-restore-state"),
+            session_expires_at: Some(time::OffsetDateTime::now_utc() - time::Duration::days(1)),
+            last_revalidated_at: None,
+        })
+        .await
+        .unwrap();
+    assert!(
+        state
+            .creator_authority_manager()
+            .require_creator_authority(&creator())
+            .await
+            .is_err()
+    );
+    let app = router(state);
+
+    let response = app
+        .oneshot(empty_request(
+            "GET",
+            "/creators/pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/authority-status",
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(header::CACHE_CONTROL).unwrap(),
+        "no-store"
+    );
+    assert_eq!(
+        response_json(response).await,
+        json!({
+            "creator": "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy",
             "authorized": false,
         })
     );

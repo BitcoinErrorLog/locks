@@ -12,7 +12,9 @@ use locks_service::application::models::{
 use locks_service::application::use_cases::exchange_frontend_session_code::{
     ExchangeFrontendSessionCodeRequest, ExchangeFrontendSessionCodeResponse,
 };
-use locks_service::application::use_cases::get_creator_authority_status::CreatorAuthorityStatusView;
+use locks_service::application::use_cases::get_creator_authority_status::{
+    CreatorAuthorityStatusView, PublicCreatorAuthorityStatusView,
+};
 use locks_service::application::use_cases::get_verification_task::VerificationTaskLifecycleView;
 use locks_service::application::use_cases::issue_access_credential::IssuedAccessCredential;
 
@@ -185,6 +187,21 @@ impl From<CreatorAuthorityStatusView> for CreatorAuthorityStatusHttpResponse {
                 .map(|auth_kind| auth_kind.as_str().to_owned()),
             granted_scopes: view.granted_scopes,
             session_expires_at: view.session_expires_at,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PublicCreatorAuthorityStatusHttpResponse {
+    pub creator: CreatorPubky,
+    pub authorized: bool,
+}
+
+impl From<PublicCreatorAuthorityStatusView> for PublicCreatorAuthorityStatusHttpResponse {
+    fn from(view: PublicCreatorAuthorityStatusView) -> Self {
+        Self {
+            creator: view.creator,
+            authorized: view.authorized,
         }
     }
 }

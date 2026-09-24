@@ -1,14 +1,18 @@
+use std::str::FromStr;
+
 use axum::Json;
 use axum::extract::rejection::{JsonRejection, QueryRejection};
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri, header};
 use axum::response::{Html, IntoResponse, Response};
+use locks_core::ids::CreatorPubky;
 use locks_service::application::use_cases::complete_creator_connect_flow::{
     CompleteCreatorConnectFlowRequest, complete_creator_connect_flow,
 };
 use locks_service::application::use_cases::exchange_frontend_session_code::exchange_frontend_session_code;
 use locks_service::application::use_cases::get_creator_authority_status::{
     GetCreatorAuthorityStatusRequest, get_creator_authority_status,
+    get_public_creator_authority_status,
 };
 use locks_service::application::use_cases::start_creator_connect_flow::{
     StartCreatorConnectFlowRequest, start_creator_connect_flow,
@@ -23,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use crate::api::auth::parse_frontend_session_token;
 use crate::api::dtos::{
     CreatorAuthorityStatusHttpResponse, ExchangeFrontendSessionCodeHttpRequest,
-    ExchangeFrontendSessionCodeHttpResponse,
+    ExchangeFrontendSessionCodeHttpResponse, PublicCreatorAuthorityStatusHttpResponse,
 };
 use crate::api::errors::{ApiError, ApiErrorCode};
 use crate::api::extractors::parse_json;
@@ -43,6 +47,18 @@ pub(super) async fn creator_authority_status_route(
     .await?;
 
     Ok(Json(CreatorAuthorityStatusHttpResponse::from(status)))
+}
+
+pub(super) async fn public_creator_authority_status_route(
+    State(state): State<AppState>,
+    Path(creator): Path<String>,
+) -> Result<Json<PublicCreatorAuthorityStatusHttpResponse>, ApiError> {
+    let creator = CreatorPubky::from_str(&creator)
+        .map_err(|_| ApiError::new(ApiErrorCode::InvalidIdentifier, "invalid creator"))?;
+    let status =
+        get_public_creator_authority_status(state.creator_authorities().as_ref(), creator).await?;
+
+    Ok(Json(PublicCreatorAuthorityStatusHttpResponse::from(status)))
 }
 
 /// Postmessage message `type` published to embedding apps. Embedders MUST validate this string.

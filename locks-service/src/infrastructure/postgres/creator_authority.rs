@@ -201,6 +201,17 @@ impl CreatorAuthorityStore for PostgresCreatorAuthorityStore {
             .transpose()
     }
 
+    async fn has_creator_authority(
+        &self,
+        creator: &CreatorPubky,
+    ) -> Result<bool, ApplicationError> {
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM creator_authorities WHERE creator = $1)")
+            .bind(creator.to_string())
+            .fetch_one(&self.pool)
+            .await
+            .map_err(storage_error)
+    }
+
     async fn delete_creator_authority(
         &self,
         creator: &CreatorPubky,
@@ -426,6 +437,40 @@ mod tests {
             loaded.secret.expose_secret(),
             "legacy-cookie-session-secret"
         );
+
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn has_creator_authority_answers_from_the_row_without_decrypting_the_secret() {
+        let database = TestDatabase::create().await;
+        let store = PostgresCreatorAuthorityStore::new_encrypted(
+            database.pool().clone(),
+            CreatorAuthoritySecretCipher::new([7; 32]),
+        );
+        let connected =
+            CreatorPubky::from_str("pubkynkcct8tzquo8n4z5ysz9t963ye9kq1w7gb55aad1z4tmsgjjhmto")
+                .unwrap();
+        sqlx::query(
+            "INSERT INTO creator_authorities (
+                creator, auth_kind, granted_scopes, secret, session_expires_at,
+                last_revalidated_at, created_at, updated_at
+            )
+            VALUES (
+                $1, 'legacy_cookie', '[\"/pub/locks.app/:rw\", \"/priv/locks.app/:rw\"]'::jsonb,
+                'v1.xchacha20poly1305:not-decryptable:not-decryptable', NULL,
+                '2026-09-23 13:10:20.388214+00', '2026-09-14 11:58:54.604277+00',
+                '2026-09-23 13:10:28.645921+00'
+            )",
+        )
+        .bind(connected.to_string())
+        .execute(database.pool())
+        .await
+        .unwrap();
+
+        assert!(store.has_creator_authority(&connected).await.unwrap());
+        assert!(!store.has_creator_authority(&creator()).await.unwrap());
+        assert!(store.get_creator_authority(&connected).await.is_err());
 
         database.cleanup().await;
     }

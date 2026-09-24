@@ -2428,6 +2428,67 @@ async fn creator_authority_status_route_returns_authorized_status_without_secret
 }
 
 #[tokio::test]
+async fn public_creator_authority_status_route_reports_stored_authority_without_a_session() {
+    let state = test_state();
+    seed_creator_authority(&state).await;
+    let app = router(state);
+
+    let response = app
+        .clone()
+        .oneshot(empty_request(
+            "GET",
+            "/creators/pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/authority-status",
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await;
+    assert_eq!(
+        body,
+        json!({
+            "creator": "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy",
+            "authorized": true,
+        })
+    );
+    assert!(!body.to_string().contains("creator-authority-secret"));
+
+    let other = app
+        .oneshot(empty_request(
+            "GET",
+            "/creators/pubkyorhzqdiexwmi6iidktucgud63ufa5nwtsuzdxe176a8izd6jsqky/authority-status",
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(other.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(other).await,
+        json!({
+            "creator": "pubkyorhzqdiexwmi6iidktucgud63ufa5nwtsuzdxe176a8izd6jsqky",
+            "authorized": false,
+        })
+    );
+}
+
+#[tokio::test]
+async fn public_creator_authority_status_route_rejects_an_invalid_creator() {
+    let app = router(test_state());
+
+    let response = app
+        .oneshot(empty_request(
+            "GET",
+            "/creators/not-a-pubky/authority-status",
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = response_json(response).await;
+    assert_eq!(body["error"]["code"], "invalid_identifier");
+}
+
+#[tokio::test]
 async fn frontend_session_signout_revokes_current_session() {
     let mut config = test_config(RuntimeEnvironment::Production, false);
     config.creator_authority_acquisition.enabled = true;

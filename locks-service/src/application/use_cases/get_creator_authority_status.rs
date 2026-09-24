@@ -67,6 +67,31 @@ pub async fn get_creator_authority_status(
     })
 }
 
+/// Creator-keyed status that carries no session, auth kind, scopes, or expiry.
+///
+/// Callers learn only whether this Lock Server holds authority for `creator`, so a
+/// seller UI can show the connection after its frontend session has expired or its
+/// browser storage was cleared, without asking the creator to approve again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublicCreatorAuthorityStatusView {
+    /// Creator identity from the request path, in canonical form.
+    pub creator: CreatorPubky,
+    /// Whether this Lock Server currently has stored creator authority.
+    pub authorized: bool,
+}
+
+/// Returns whether this Lock Server holds creator authority, without a frontend session.
+pub async fn get_public_creator_authority_status(
+    creator_authorities: &dyn CreatorAuthorityStore,
+    creator: CreatorPubky,
+) -> Result<PublicCreatorAuthorityStatusView, ApplicationError> {
+    let authorized = creator_authorities.has_creator_authority(&creator).await?;
+    Ok(PublicCreatorAuthorityStatusView {
+        creator,
+        authorized,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::str::FromStr;
@@ -76,7 +101,10 @@ mod tests {
     use locks_core::ids::CreatorPubky;
     use time::{Duration, OffsetDateTime};
 
-    use super::{GetCreatorAuthorityStatusRequest, get_creator_authority_status};
+    use super::{
+        GetCreatorAuthorityStatusRequest, get_creator_authority_status,
+        get_public_creator_authority_status,
+    };
     use crate::application::errors::ApplicationError;
     use crate::application::models::{
         CreatorAuthorityAuthKind, CreatorAuthorityRecord, CreatorAuthoritySecret,
@@ -183,6 +211,32 @@ mod tests {
         let debug = format!("{status:?}");
         assert!(!debug.contains("creator-authority-secret"));
         assert!(!debug.contains("frontend-session-token"));
+    }
+
+    #[tokio::test]
+    async fn public_creator_authority_status_reports_presence_without_a_frontend_session() {
+        let missing = get_public_creator_authority_status(&AuthorityStore::default(), creator())
+            .await
+            .unwrap();
+        assert_eq!(missing.creator, creator());
+        assert!(!missing.authorized);
+
+        let present = get_public_creator_authority_status(
+            &AuthorityStore::with_record(CreatorAuthorityRecord {
+                creator: creator(),
+                auth_kind: CreatorAuthorityAuthKind::LegacyCookie,
+                granted_scopes: vec!["/pub/locks.app/:rw".to_owned()],
+                secret: CreatorAuthoritySecret::new("creator-authority-secret"),
+                session_expires_at: None,
+                last_revalidated_at: None,
+            }),
+            creator(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(present.creator, creator());
+        assert!(present.authorized);
+        assert!(!format!("{present:?}").contains("creator-authority-secret"));
     }
 
     fn session_record(now: OffsetDateTime) -> FrontendSessionRecord {

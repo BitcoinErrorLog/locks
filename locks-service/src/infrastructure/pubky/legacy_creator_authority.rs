@@ -1,10 +1,12 @@
 use async_trait::async_trait;
+use time::OffsetDateTime;
 
 use locks_core::ids::CreatorPubky;
 
 use crate::application::errors::ApplicationError;
 use crate::application::models::{
-    CreatorAuthorityAuthKind, CreatorAuthorityRecord, CreatorAuthoritySecret,
+    CreatorAuthorityAuthKind, CreatorAuthorityCheckOutcome, CreatorAuthorityRecord,
+    CreatorAuthoritySecret,
 };
 use crate::application::ports::{
     CreatorAuthorityManager, CreatorAuthorityStatus, CreatorAuthorityStore,
@@ -45,9 +47,49 @@ impl LegacyCookieSessionRevalidator for PubkyLegacyCookieSessionRevalidator {
         pubky::PubkySession::import_secret(secret.expose_secret(), Some(self.client.clone()))
             .await
             .map(|_| ())
-            .map_err(|_| ApplicationError::CreatorAuthoritySecret {
-                message: "failed to restore legacy creator authority secret".to_owned(),
+            .map_err(|error| {
+                classify_homeserver_restore_error(&error, || {
+                    ApplicationError::CreatorAuthoritySecret {
+                        message: "failed to restore legacy creator authority secret".to_owned(),
+                    }
+                })
             })
+    }
+}
+
+/// Maps a Pubky SDK restore failure to what it says about the stored authority.
+///
+/// - 401, 403, 404, or 410 from the homeserver: the authority was refused (revoked, expired,
+///   or unknown there), so [`ApplicationError::CreatorAuthorityRefused`].
+/// - Transport failure, 408, 429, 5xx, or DHT resolution: nothing is known about the
+///   authority, so [`ApplicationError::CreatorAuthorityCheckUnavailable`].
+/// - Anything else (local parse, auth-token, or build failure): `local()`, a secret error
+///   that callers surface instead of recording.
+pub fn classify_homeserver_restore_error(
+    error: &pubky::Error,
+    local: impl FnOnce() -> ApplicationError,
+) -> ApplicationError {
+    use pubky::StatusCode;
+    use pubky::errors::RequestError;
+
+    match error {
+        pubky::Error::Request(RequestError::Server { status, .. }) => match *status {
+            StatusCode::UNAUTHORIZED
+            | StatusCode::FORBIDDEN
+            | StatusCode::NOT_FOUND
+            | StatusCode::GONE => ApplicationError::CreatorAuthorityRefused,
+            StatusCode::REQUEST_TIMEOUT | StatusCode::TOO_MANY_REQUESTS => {
+                ApplicationError::CreatorAuthorityCheckUnavailable
+            }
+            status if status.is_server_error() => {
+                ApplicationError::CreatorAuthorityCheckUnavailable
+            }
+            _ => local(),
+        },
+        pubky::Error::Request(RequestError::Transport(_)) | pubky::Error::Pkarr(_) => {
+            ApplicationError::CreatorAuthorityCheckUnavailable
+        }
+        _ => local(),
     }
 }
 
@@ -138,6 +180,11 @@ impl<S, R, G> LegacyCookieCreatorAuthorityManager<S, R, G> {
         }
     }
 
+    /// Returns the creator authority store. Exposed for tests and adapter composition.
+    pub fn store(&self) -> &S {
+        &self.store
+    }
+
     /// Returns the revalidator. Exposed for tests and adapter composition.
     pub fn revalidator(&self) -> &R {
         &self.revalidator
@@ -166,18 +213,34 @@ where
             .await?
             .ok_or(ApplicationError::CreatorAuthorityUnavailable)?;
 
-        match record.auth_kind {
+        let checked = match record.auth_kind {
             CreatorAuthorityAuthKind::LegacyCookie => {
                 self.revalidator
                     .revalidate_legacy_cookie_secret(&record.secret)
-                    .await?;
+                    .await
             }
             CreatorAuthorityAuthKind::Grant => {
                 self.grant_revalidator
                     .revalidate_grant_credential(creator, &record.secret)
-                    .await?;
+                    .await
             }
+        };
+
+        // Only the homeserver's own answer is recorded. Transport failures and local secret
+        // errors say nothing about the authority, so they leave the stored validity alone.
+        let outcome = match &checked {
+            Ok(()) => Some(CreatorAuthorityCheckOutcome::Honored),
+            Err(ApplicationError::CreatorAuthorityRefused) => {
+                Some(CreatorAuthorityCheckOutcome::Refused)
+            }
+            Err(_) => None,
+        };
+        if let Some(outcome) = outcome {
+            self.store
+                .record_creator_authority_check(creator, outcome, OffsetDateTime::now_utc())
+                .await?;
         }
+        checked?;
 
         Ok(record_to_authorized_status(record))
     }
@@ -211,11 +274,12 @@ mod tests {
 
     use super::{
         GrantCredentialRevalidator, LegacyCookieCreatorAuthorityManager,
-        LegacyCookieSessionRevalidator,
+        LegacyCookieSessionRevalidator, classify_homeserver_restore_error,
     };
     use crate::application::errors::ApplicationError;
     use crate::application::models::{
-        CreatorAuthorityAuthKind, CreatorAuthorityRecord, CreatorAuthoritySecret,
+        CreatorAuthorityAuthKind, CreatorAuthorityCheckOutcome, CreatorAuthorityRecord,
+        CreatorAuthoritySecret, CreatorAuthorityValidity,
     };
     use crate::application::ports::{
         CreatorAuthorityManager, CreatorAuthorityStatus, CreatorAuthorityStore,
@@ -345,14 +409,105 @@ mod tests {
         assert!(!format!("{error:?}").contains("legacy-cookie-session-secret"));
     }
 
+    #[tokio::test]
+    async fn manager_records_the_homeserver_answer_but_never_an_unreachable_one() {
+        for (answer, recorded) in [
+            (Ok(()), vec![CreatorAuthorityCheckOutcome::Honored]),
+            (
+                Err(ApplicationError::CreatorAuthorityRefused),
+                vec![CreatorAuthorityCheckOutcome::Refused],
+            ),
+            (
+                Err(ApplicationError::CreatorAuthorityCheckUnavailable),
+                vec![],
+            ),
+            (
+                Err(ApplicationError::CreatorAuthoritySecret {
+                    message: "failed to restore legacy creator authority secret".to_owned(),
+                }),
+                vec![],
+            ),
+        ] {
+            let expected_error = answer.clone().err();
+            let manager = LegacyCookieCreatorAuthorityManager::new(
+                FakeCreatorAuthorityStore::new(Some(creator_authority_record(
+                    "legacy-cookie-session-secret",
+                ))),
+                FakeLegacyCookieSessionRevalidator::new(answer),
+            );
+
+            let result = manager.require_creator_authority(&creator()).await;
+
+            assert_eq!(result.err(), expected_error);
+            assert_eq!(*manager.store().checks.lock().unwrap(), recorded);
+        }
+    }
+
+    #[test]
+    fn homeserver_status_classifies_refusal_apart_from_an_unreachable_homeserver() {
+        use pubky::StatusCode;
+        use pubky::errors::{AuthError, RequestError};
+
+        let server = |status: StatusCode| {
+            pubky::Error::Request(RequestError::Server {
+                status,
+                message: String::new(),
+            })
+        };
+        let local = || ApplicationError::CreatorAuthoritySecret {
+            message: "local".to_owned(),
+        };
+
+        for status in [
+            StatusCode::UNAUTHORIZED,
+            StatusCode::FORBIDDEN,
+            StatusCode::NOT_FOUND,
+            StatusCode::GONE,
+        ] {
+            assert_eq!(
+                classify_homeserver_restore_error(&server(status), local),
+                ApplicationError::CreatorAuthorityRefused,
+                "{status}"
+            );
+        }
+        for status in [
+            StatusCode::REQUEST_TIMEOUT,
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::BAD_GATEWAY,
+            StatusCode::SERVICE_UNAVAILABLE,
+        ] {
+            assert_eq!(
+                classify_homeserver_restore_error(&server(status), local),
+                ApplicationError::CreatorAuthorityCheckUnavailable,
+                "{status}"
+            );
+        }
+        assert_eq!(
+            classify_homeserver_restore_error(&server(StatusCode::BAD_REQUEST), local),
+            local()
+        );
+        assert_eq!(
+            classify_homeserver_restore_error(
+                &pubky::Error::Authentication(AuthError::RequestExpired),
+                local
+            ),
+            local()
+        );
+    }
+
     #[derive(Debug)]
     struct FakeCreatorAuthorityStore {
         record: Option<CreatorAuthorityRecord>,
+        checks: Mutex<Vec<CreatorAuthorityCheckOutcome>>,
     }
 
     impl FakeCreatorAuthorityStore {
         fn new(record: Option<CreatorAuthorityRecord>) -> Self {
-            Self { record }
+            Self {
+                record,
+                checks: Mutex::new(Vec::new()),
+            }
         }
     }
 
@@ -374,6 +529,27 @@ mod tests {
                 .as_ref()
                 .filter(|record| &record.creator == creator)
                 .cloned())
+        }
+
+        async fn get_creator_authority_validity(
+            &self,
+            creator: &CreatorPubky,
+        ) -> Result<Option<CreatorAuthorityValidity>, ApplicationError> {
+            Ok(self
+                .record
+                .as_ref()
+                .filter(|record| &record.creator == creator)
+                .map(|record| CreatorAuthorityValidity::from_record(record, None)))
+        }
+
+        async fn record_creator_authority_check(
+            &self,
+            _creator: &CreatorPubky,
+            outcome: CreatorAuthorityCheckOutcome,
+            _checked_at: time::OffsetDateTime,
+        ) -> Result<(), ApplicationError> {
+            self.checks.lock().unwrap().push(outcome);
+            Ok(())
         }
 
         async fn delete_creator_authority(

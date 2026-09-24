@@ -6,9 +6,9 @@ use locks_core::ids::CreatorPubky;
 use locks_service::application::{
     errors::ApplicationError,
     models::{
-        CreatorAuthorityRecord, CreatorConnectFlowId, FrontendSessionCode,
-        FrontendSessionCodeRecord, FrontendSessionRecord, FrontendSessionToken,
-        PendingCreatorConnectFlowRecord,
+        CreatorAuthorityCheckOutcome, CreatorAuthorityRecord, CreatorAuthorityValidity,
+        CreatorConnectFlowId, FrontendSessionCode, FrontendSessionCodeRecord,
+        FrontendSessionRecord, FrontendSessionToken, PendingCreatorConnectFlowRecord,
     },
     ports::{
         AccessCredentialStore, CreatorAuthorityManager, CreatorAuthorityStore,
@@ -37,6 +37,7 @@ pub(super) struct PrivateRuntimeAdapters {
 #[derive(Debug, Clone, Default)]
 pub(super) struct InMemoryCreatorAuthorityStore {
     records: Arc<RwLock<HashMap<CreatorPubky, CreatorAuthorityRecord>>>,
+    refusals: Arc<RwLock<HashMap<CreatorPubky, OffsetDateTime>>>,
 }
 
 impl InMemoryCreatorAuthorityStore {
@@ -51,6 +52,7 @@ impl CreatorAuthorityStore for InMemoryCreatorAuthorityStore {
         &self,
         authority: CreatorAuthorityRecord,
     ) -> Result<(), ApplicationError> {
+        self.refusals.write().await.remove(&authority.creator);
         self.records
             .write()
             .await
@@ -65,11 +67,50 @@ impl CreatorAuthorityStore for InMemoryCreatorAuthorityStore {
         Ok(self.records.read().await.get(creator).cloned())
     }
 
+    async fn get_creator_authority_validity(
+        &self,
+        creator: &CreatorPubky,
+    ) -> Result<Option<CreatorAuthorityValidity>, ApplicationError> {
+        let refused_at = self.refusals.read().await.get(creator).copied();
+        Ok(self
+            .records
+            .read()
+            .await
+            .get(creator)
+            .map(|record| CreatorAuthorityValidity::from_record(record, refused_at)))
+    }
+
+    async fn record_creator_authority_check(
+        &self,
+        creator: &CreatorPubky,
+        outcome: CreatorAuthorityCheckOutcome,
+        checked_at: OffsetDateTime,
+    ) -> Result<(), ApplicationError> {
+        let mut records = self.records.write().await;
+        let Some(record) = records.get_mut(creator) else {
+            return Ok(());
+        };
+        match outcome {
+            CreatorAuthorityCheckOutcome::Honored => {
+                record.last_revalidated_at = Some(checked_at);
+                self.refusals.write().await.remove(creator);
+            }
+            CreatorAuthorityCheckOutcome::Refused => {
+                self.refusals
+                    .write()
+                    .await
+                    .insert(creator.clone(), checked_at);
+            }
+        }
+        Ok(())
+    }
+
     async fn delete_creator_authority(
         &self,
         creator: &CreatorPubky,
     ) -> Result<(), ApplicationError> {
         self.records.write().await.remove(creator);
+        self.refusals.write().await.remove(creator);
         Ok(())
     }
 }

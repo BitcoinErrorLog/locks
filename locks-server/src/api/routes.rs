@@ -6,6 +6,7 @@ use crate::api::access::{issue_access_credential, proxy_read_guarded_resource};
 use crate::api::creator_authority::{
     connect_shell_complete, connect_shell_start, creator_authority_status_route,
     exchange_frontend_session_code_route, frontend_session_signout_route,
+    public_creator_authority_status_route,
 };
 use crate::api::creator_publishing::{
     create_content_lock_for_authenticated_creator,
@@ -34,6 +35,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/creator/authority-status",
             get(creator_authority_status_route),
+        )
+        .route(
+            "/creators/{creator}/authority-status",
+            get(public_creator_authority_status_route),
         )
         .route(
             "/creator/paykit/setup-status",

@@ -53,6 +53,7 @@ mod tests {
         assert_column_exists(&mut connection, "verification_tasks", "bundle_id").await;
         assert_column_exists(&mut connection, "verification_tasks", "next_attempt_at").await;
         assert_column_exists(&mut connection, "verification_tasks", "claim_token").await;
+        assert_column_exists(&mut connection, "creator_authorities", "refused_at").await;
         assert_index_exists(
             &mut connection,
             "verification_tasks",

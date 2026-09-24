@@ -15,7 +15,8 @@ use locks_core::ids::CreatorPubky;
 
 use crate::application::errors::ApplicationError;
 use crate::application::models::{
-    CreatorAuthorityAuthKind, CreatorAuthorityRecord, CreatorAuthoritySecret,
+    CreatorAuthorityAuthKind, CreatorAuthorityCheckOutcome, CreatorAuthorityRecord,
+    CreatorAuthoritySecret, CreatorAuthorityValidity,
 };
 use crate::application::ports::CreatorAuthorityStore;
 
@@ -162,6 +163,7 @@ impl CreatorAuthorityStore for PostgresCreatorAuthorityStore {
                 secret = EXCLUDED.secret,
                 session_expires_at = EXCLUDED.session_expires_at,
                 last_revalidated_at = EXCLUDED.last_revalidated_at,
+                refused_at = NULL,
                 updated_at = now()",
         )
         .bind(authority.creator.to_string())
@@ -199,6 +201,56 @@ impl CreatorAuthorityStore for PostgresCreatorAuthorityStore {
 
         row.map(|row| row_to_record(row, self.cipher.as_ref()))
             .transpose()
+    }
+
+    async fn get_creator_authority_validity(
+        &self,
+        creator: &CreatorPubky,
+    ) -> Result<Option<CreatorAuthorityValidity>, ApplicationError> {
+        let row = sqlx::query(
+            "SELECT
+                creator,
+                auth_kind,
+                granted_scopes,
+                session_expires_at,
+                last_revalidated_at,
+                refused_at
+            FROM creator_authorities
+            WHERE creator = $1",
+        )
+        .bind(creator.to_string())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(storage_error)?;
+
+        row.map(row_to_validity).transpose()
+    }
+
+    async fn record_creator_authority_check(
+        &self,
+        creator: &CreatorPubky,
+        outcome: CreatorAuthorityCheckOutcome,
+        checked_at: time::OffsetDateTime,
+    ) -> Result<(), ApplicationError> {
+        let query = match outcome {
+            CreatorAuthorityCheckOutcome::Honored => {
+                "UPDATE creator_authorities
+                SET last_revalidated_at = $2, refused_at = NULL, updated_at = now()
+                WHERE creator = $1"
+            }
+            CreatorAuthorityCheckOutcome::Refused => {
+                "UPDATE creator_authorities
+                SET refused_at = $2, updated_at = now()
+                WHERE creator = $1"
+            }
+        };
+        sqlx::query(query)
+            .bind(creator.to_string())
+            .bind(checked_at)
+            .execute(&self.pool)
+            .await
+            .map_err(storage_error)?;
+        Ok(())
     }
 
     async fn delete_creator_authority(
@@ -247,6 +299,32 @@ fn row_to_record(
     })
 }
 
+fn row_to_validity(
+    row: sqlx::postgres::PgRow,
+) -> Result<CreatorAuthorityValidity, ApplicationError> {
+    let creator =
+        CreatorPubky::from_str(&row.try_get::<String, _>("creator").map_err(storage_error)?)
+            .map_err(|error| ApplicationError::Storage {
+                message: format!("invalid creator authority creator stored in Postgres: {error}"),
+            })?;
+    let auth_kind = CreatorAuthorityAuthKind::from_str(
+        &row.try_get::<String, _>("auth_kind")
+            .map_err(storage_error)?,
+    )?;
+
+    Ok(CreatorAuthorityValidity {
+        creator,
+        auth_kind,
+        granted_scopes: row
+            .try_get::<Json<Vec<String>>, _>("granted_scopes")
+            .map_err(storage_error)?
+            .0,
+        session_expires_at: row.try_get("session_expires_at").map_err(storage_error)?,
+        last_revalidated_at: row.try_get("last_revalidated_at").map_err(storage_error)?,
+        refused_at: row.try_get("refused_at").map_err(storage_error)?,
+    })
+}
+
 fn creator_authority_secret_aad(
     creator: &CreatorPubky,
     auth_kind: CreatorAuthorityAuthKind,
@@ -289,7 +367,8 @@ mod tests {
     use super::{CreatorAuthoritySecretCipher, PostgresCreatorAuthorityStore};
     use crate::application::errors::ApplicationError;
     use crate::application::models::{
-        CreatorAuthorityAuthKind, CreatorAuthorityRecord, CreatorAuthoritySecret,
+        CreatorAuthorityAuthKind, CreatorAuthorityCheckOutcome, CreatorAuthorityRecord,
+        CreatorAuthoritySecret,
     };
     use crate::application::ports::CreatorAuthorityStore;
     use crate::infrastructure::postgres::testing::TestDatabase;
@@ -426,6 +505,124 @@ mod tests {
             loaded.secret.expose_secret(),
             "legacy-cookie-session-secret"
         );
+
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn validity_reads_without_the_secret_and_records_each_real_check() {
+        let database = TestDatabase::create().await;
+        let store = PostgresCreatorAuthorityStore::new_encrypted(
+            database.pool().clone(),
+            CreatorAuthoritySecretCipher::new([7; 32]),
+        );
+        let connected =
+            CreatorPubky::from_str("pubkynkcct8tzquo8n4z5ysz9t963ye9kq1w7gb55aad1z4tmsgjjhmto")
+                .unwrap();
+        // Pav's production row shape; the secret is a placeholder this key cannot decrypt.
+        sqlx::query(
+            "INSERT INTO creator_authorities (
+                creator, auth_kind, granted_scopes, secret, session_expires_at,
+                last_revalidated_at, created_at, updated_at
+            )
+            VALUES (
+                $1, 'legacy_cookie', '[\"/pub/locks.app/:rw\", \"/priv/locks.app/:rw\"]'::jsonb,
+                'v1.xchacha20poly1305:not-decryptable:not-decryptable', NULL,
+                '2026-09-23 13:10:20.388214+00', '2026-09-14 11:58:54.604277+00',
+                '2026-09-23 13:10:28.645921+00'
+            )",
+        )
+        .bind(connected.to_string())
+        .execute(database.pool())
+        .await
+        .unwrap();
+        assert!(store.get_creator_authority(&connected).await.is_err());
+
+        let validity = store
+            .get_creator_authority_validity(&connected)
+            .await
+            .unwrap()
+            .expect("stored row");
+        assert_eq!(validity.auth_kind, CreatorAuthorityAuthKind::LegacyCookie);
+        assert_eq!(
+            validity.last_revalidated_at,
+            Some(datetime!(2026-09-23 13:10:20.388214 UTC))
+        );
+        assert_eq!(validity.refused_at, None);
+        assert!(validity.is_usable_at(datetime!(2026-09-24 14:15:00 UTC)));
+        assert_eq!(
+            store
+                .get_creator_authority_validity(&creator())
+                .await
+                .unwrap(),
+            None
+        );
+
+        let refused_at = datetime!(2026-09-24 15:00:00 UTC);
+        store
+            .record_creator_authority_check(
+                &connected,
+                CreatorAuthorityCheckOutcome::Refused,
+                refused_at,
+            )
+            .await
+            .unwrap();
+        let refused = store
+            .get_creator_authority_validity(&connected)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(refused.refused_at, Some(refused_at));
+        assert!(!refused.is_usable_at(refused_at));
+
+        let honored_at = datetime!(2026-09-24 16:00:00 UTC);
+        store
+            .record_creator_authority_check(
+                &connected,
+                CreatorAuthorityCheckOutcome::Honored,
+                honored_at,
+            )
+            .await
+            .unwrap();
+        let honored = store
+            .get_creator_authority_validity(&connected)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(honored.refused_at, None);
+        assert_eq!(honored.last_revalidated_at, Some(honored_at));
+
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn a_new_approval_clears_a_recorded_refusal() {
+        let database = TestDatabase::create().await;
+        let store = PostgresCreatorAuthorityStore::new(database.pool().clone());
+        store
+            .upsert_creator_authority(creator_authority_record("first-cookie"))
+            .await
+            .unwrap();
+        store
+            .record_creator_authority_check(
+                &creator(),
+                CreatorAuthorityCheckOutcome::Refused,
+                datetime!(2026-09-24 15:00:00 UTC),
+            )
+            .await
+            .unwrap();
+
+        store
+            .upsert_creator_authority(creator_authority_record("second-cookie"))
+            .await
+            .unwrap();
+
+        let validity = store
+            .get_creator_authority_validity(&creator())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(validity.refused_at, None);
 
         database.cleanup().await;
     }

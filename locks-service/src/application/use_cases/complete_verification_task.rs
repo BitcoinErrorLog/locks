@@ -368,6 +368,8 @@ fn viewer_safe_failure_message(error: &ApplicationError) -> &'static str {
         | ApplicationError::CredentialGeneration { .. }
         | ApplicationError::CreatorAuthorityUnavailable
         | ApplicationError::CreatorAuthoritySecret { .. }
+        | ApplicationError::CreatorAuthorityRefused
+        | ApplicationError::CreatorAuthorityCheckUnavailable
         | ApplicationError::InvalidCreatorAuthorityAuthKind { .. }
         | ApplicationError::CreatorConnectFlowUnavailable
         | ApplicationError::CreatorConnectFlowExpired

@@ -45,10 +45,10 @@ use crate::api::dtos::{
 };
 use crate::app_state::{AppState, ReaderPubkyResolver};
 use crate::config::{
-    ContentLocksConfig, CreatorAuthorityAcquisitionConfig, CreatorAuthorityAcquisitionMethod,
-    DatabaseConfig, LockServerCredentialsConfig, LockServerRuntimeConfig, LoggingConfig,
-    PubkyConfig, RateLimitsConfig, RuntimeConfig, RuntimeEnvironment, SecretsConfig,
-    VerificationSubmissionRateLimitConfig, WorkerConfig,
+    AuthorityRevalidationConfig, ContentLocksConfig, CreatorAuthorityAcquisitionConfig,
+    CreatorAuthorityAcquisitionMethod, DatabaseConfig, LockServerCredentialsConfig,
+    LockServerRuntimeConfig, LoggingConfig, PubkyConfig, RateLimitsConfig, RuntimeConfig,
+    RuntimeEnvironment, SecretsConfig, VerificationSubmissionRateLimitConfig, WorkerConfig,
 };
 use crate::paykit_http_client::{
     PaykitSetupStatusKind, PaykitSetupStatusProvider, PaykitSetupStatusProviderError,
@@ -2587,6 +2587,82 @@ async fn creator_authority_status_route_reports_an_expired_grant_as_not_authoriz
 }
 
 #[tokio::test]
+async fn public_creator_authority_status_is_limited_per_railway_client_not_the_proxy() {
+    let mut config = test_config(RuntimeEnvironment::Development, true);
+    config.rate_limits.trusted_proxy_hops = 2;
+    config.rate_limits.public_authority_status.max_requests = 2;
+    config.rate_limits.public_authority_status.window_seconds = 60;
+    let state = AppState::new_empty_in_memory(config);
+    seed_creator_authority(&state).await;
+    let app = router(state);
+    let uri =
+        "/creators/pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/authority-status";
+
+    for _ in 0..2 {
+        let response = app
+            .clone()
+            .oneshot(forwarded_status_request(uri, "203.0.113.10, 198.51.100.7"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    let limited = app
+        .clone()
+        .oneshot(forwarded_status_request(uri, "203.0.113.10, 198.51.100.7"))
+        .await
+        .unwrap();
+    assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+    let retry_after = limited
+        .headers()
+        .get(header::RETRY_AFTER)
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(retry_after.parse::<u64>().unwrap() >= 1);
+    assert_eq!(
+        response_json(limited).await["error"]["code"],
+        "rate_limited"
+    );
+
+    let other_client = app
+        .clone()
+        .oneshot(forwarded_status_request(uri, "203.0.113.11, 198.51.100.7"))
+        .await
+        .unwrap();
+    assert_eq!(other_client.status(), StatusCode::OK);
+
+    let spoofed_leading_hop = app
+        .oneshot(forwarded_status_request(
+            uri,
+            "192.0.2.9, 203.0.113.10, 198.51.100.7",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(spoofed_leading_hop.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(
+        spoofed_leading_hop
+            .headers()
+            .get(header::RETRY_AFTER)
+            .is_some()
+    );
+}
+
+fn forwarded_status_request(uri: &str, forwarded_for: &str) -> Request<Body> {
+    let mut request = Request::builder()
+        .method("GET")
+        .uri(uri)
+        .header("x-forwarded-for", forwarded_for)
+        .body(Body::empty())
+        .unwrap();
+    request.extensions_mut().insert(ConnectInfo(SocketAddr::new(
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+        443,
+    )));
+    request
+}
+
+#[tokio::test]
 async fn public_creator_authority_status_route_rejects_an_invalid_creator() {
     let app = router(test_state());
 
@@ -3278,6 +3354,7 @@ fn test_state_with_rate_limit(enabled: bool, max_requests: u32, window_seconds: 
             max_requests,
             window_seconds,
         },
+        ..RateLimitsConfig::default()
     };
     AppState::new_empty_in_memory(config)
 }
@@ -3377,6 +3454,7 @@ fn test_config(
         pkdns: crate::config::PkdnsConfig::default(),
         rate_limits: RateLimitsConfig::default(),
         content_locks: ContentLocksConfig::default(),
+        authority_revalidation: AuthorityRevalidationConfig::default(),
         paykit: None,
     }
 }
@@ -3935,11 +4013,16 @@ fn json_request_with_client_address(
 }
 
 fn empty_request(method: &str, uri: &str) -> Request<Body> {
-    Request::builder()
+    let mut request = Request::builder()
         .method(method)
         .uri(uri)
         .body(Body::empty())
-        .unwrap()
+        .unwrap();
+    request.extensions_mut().insert(ConnectInfo(SocketAddr::new(
+        IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+        12345,
+    )));
+    request
 }
 
 fn authorization_headers(values: &[&str]) -> HeaderMap {

@@ -176,9 +176,9 @@ mod tests {
     use pkarr::dns::rdata::RData;
 
     use crate::config::{
-        ContentLocksConfig, CreatorAuthorityAcquisitionConfig, DatabaseConfig,
-        LockServerCredentialsConfig, LoggingConfig, PubkyConfig, RateLimitsConfig, RuntimeConfig,
-        RuntimeEnvironment, SecretsConfig, WorkerConfig,
+        AuthorityRevalidationConfig, ContentLocksConfig, CreatorAuthorityAcquisitionConfig,
+        DatabaseConfig, LockServerCredentialsConfig, LoggingConfig, PubkyConfig, RateLimitsConfig,
+        RuntimeConfig, RuntimeEnvironment, SecretsConfig, WorkerConfig,
     };
 
     use super::*;
@@ -366,6 +366,7 @@ mod tests {
             pkdns: PkdnsConfig::default(),
             rate_limits: RateLimitsConfig::default(),
             content_locks: ContentLocksConfig::default(),
+            authority_revalidation: AuthorityRevalidationConfig::default(),
             paykit: None,
         }
     }

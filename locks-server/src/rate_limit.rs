@@ -5,7 +5,7 @@ use std::sync::Mutex;
 use locks_core::ids::CreatorPubky;
 use time::OffsetDateTime;
 
-use crate::config::VerificationSubmissionRateLimitConfig;
+use crate::config::{PublicAuthorityStatusRateLimitConfig, VerificationSubmissionRateLimitConfig};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct VerificationSubmissionRateLimitKey {
@@ -50,6 +50,50 @@ impl InMemoryVerificationSubmissionRateLimiter {
 
         let mut windows = self.windows.lock().expect("rate limiter mutex poisoned");
         let window = windows.entry(key.clone()).or_insert(WindowCounter {
+            started_at: now,
+            count: 0,
+        });
+
+        if window_has_expired(window.started_at, now, self.config.window_seconds) {
+            window.started_at = now;
+            window.count = 0;
+        }
+
+        if window.count < self.config.max_requests {
+            window.count += 1;
+            return RateLimitDecision::allowed();
+        }
+
+        RateLimitDecision::rejected(retry_after_seconds(
+            window.started_at,
+            now,
+            self.config.window_seconds,
+        ))
+    }
+}
+
+/// Per-client limiter for anonymous creator authority status reads.
+#[derive(Debug)]
+pub struct InMemoryPublicAuthorityStatusRateLimiter {
+    config: PublicAuthorityStatusRateLimitConfig,
+    windows: Mutex<HashMap<IpAddr, WindowCounter>>,
+}
+
+impl InMemoryPublicAuthorityStatusRateLimiter {
+    pub fn new(config: PublicAuthorityStatusRateLimitConfig) -> Self {
+        Self {
+            config,
+            windows: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub fn check(&self, client_address: IpAddr, now: OffsetDateTime) -> RateLimitDecision {
+        if !self.config.enabled {
+            return RateLimitDecision::allowed();
+        }
+
+        let mut windows = self.windows.lock().expect("rate limiter mutex poisoned");
+        let window = windows.entry(client_address).or_insert(WindowCounter {
             started_at: now,
             count: 0,
         });

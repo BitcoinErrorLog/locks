@@ -1151,6 +1151,14 @@ mod tests {
             Ok(())
         }
 
+        async fn list_creator_authorities_checked_before(
+            &self,
+            _checked_before: time::OffsetDateTime,
+            _limit: u32,
+        ) -> Result<Vec<locks_core::ids::CreatorPubky>, ApplicationError> {
+            Ok(Vec::new())
+        }
+
         async fn delete_creator_authority(
             &self,
             _creator: &CreatorPubky,

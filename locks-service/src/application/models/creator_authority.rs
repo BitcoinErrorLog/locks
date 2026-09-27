@@ -126,6 +126,22 @@ impl CreatorAuthorityValidity {
         }
     }
 
+    /// Later of the honored and refused timestamps. `None` means this row has never been checked.
+    pub fn last_checked_at(&self) -> Option<OffsetDateTime> {
+        match (self.last_revalidated_at, self.refused_at) {
+            (Some(honored_at), Some(refused_at)) => Some(honored_at.max(refused_at)),
+            (Some(honored_at), None) => Some(honored_at),
+            (None, Some(refused_at)) => Some(refused_at),
+            (None, None) => None,
+        }
+    }
+
+    /// True when the row has never been checked, or the last check is strictly before `cutoff`.
+    pub fn due_before(&self, cutoff: OffsetDateTime) -> bool {
+        self.last_checked_at()
+            .is_none_or(|checked_at| checked_at < cutoff)
+    }
+
     /// The one rule both authority-status routes answer with: the last real check was not
     /// refused, and any reported expiry is still in the future.
     pub fn is_usable_at(&self, now: OffsetDateTime) -> bool {

@@ -253,6 +253,41 @@ impl CreatorAuthorityStore for PostgresCreatorAuthorityStore {
         Ok(())
     }
 
+    async fn list_creator_authorities_checked_before(
+        &self,
+        checked_before: time::OffsetDateTime,
+        limit: u32,
+    ) -> Result<Vec<CreatorPubky>, ApplicationError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(
+            "SELECT creator
+            FROM creator_authorities
+            WHERE COALESCE(last_revalidated_at, '-infinity'::timestamptz) < $1
+              AND COALESCE(refused_at, '-infinity'::timestamptz) < $1
+            ORDER BY GREATEST(
+                COALESCE(last_revalidated_at, '-infinity'::timestamptz),
+                COALESCE(refused_at, '-infinity'::timestamptz)
+            ), creator
+            LIMIT $2",
+        )
+        .bind(checked_before)
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(storage_error)?;
+
+        rows.into_iter()
+            .map(|row| {
+                let creator: String = row.try_get("creator").map_err(storage_error)?;
+                CreatorPubky::from_str(&creator).map_err(|error| ApplicationError::Storage {
+                    message: format!("stored creator authority has an invalid creator: {error}"),
+                })
+            })
+            .collect()
+    }
+
     async fn delete_creator_authority(
         &self,
         creator: &CreatorPubky,
@@ -705,6 +740,76 @@ mod tests {
         assert_eq!(
             stored_scopes,
             serde_json::json!(["/pub/locks.app/:rw", "/priv/locks.app/:rw"])
+        );
+
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn lists_only_authorities_whose_last_check_is_older_than_the_cutoff() {
+        let database = TestDatabase::create().await;
+        let store = PostgresCreatorAuthorityStore::new(database.pool().clone());
+        let cutoff = datetime!(2026-09-27 12:00:00 UTC);
+        let stale = creator();
+        let fresh =
+            CreatorPubky::from_str("pubkyorhzqdiexwmi6iidktucgud63ufa5nwtsuzdxe176a8izd6jsqky")
+                .unwrap();
+        let never =
+            CreatorPubky::from_str("pubky3kj4afafdba8diu5oxd96dz6orrqt5nfgbmi473go6ju8s64z36y")
+                .unwrap();
+
+        store
+            .upsert_creator_authority(CreatorAuthorityRecord {
+                creator: stale.clone(),
+                last_revalidated_at: Some(datetime!(2026-09-27 05:00:00 UTC)),
+                ..creator_authority_record("stale-secret")
+            })
+            .await
+            .unwrap();
+        store
+            .upsert_creator_authority(CreatorAuthorityRecord {
+                creator: fresh.clone(),
+                last_revalidated_at: Some(datetime!(2026-09-27 13:00:00 UTC)),
+                ..creator_authority_record("fresh-secret")
+            })
+            .await
+            .unwrap();
+        store
+            .upsert_creator_authority(CreatorAuthorityRecord {
+                creator: never.clone(),
+                last_revalidated_at: None,
+                ..creator_authority_record("never-secret")
+            })
+            .await
+            .unwrap();
+
+        let due = store
+            .list_creator_authorities_checked_before(cutoff, 10)
+            .await
+            .unwrap();
+        assert_eq!(due, vec![never.clone(), stale.clone()]);
+        assert!(
+            store
+                .list_creator_authorities_checked_before(cutoff, 0)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        store
+            .record_creator_authority_check(
+                &stale,
+                CreatorAuthorityCheckOutcome::Refused,
+                datetime!(2026-09-27 13:30:00 UTC),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .list_creator_authorities_checked_before(cutoff, 10)
+                .await
+                .unwrap(),
+            vec![never]
         );
 
         database.cleanup().await;

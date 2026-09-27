@@ -22,9 +22,9 @@ use crate::{
     api::routes::router,
     app_state::AppState,
     config::{
-        ContentLocksConfig, DatabaseConfig, LockServerCredentialsConfig, LockServerRuntimeConfig,
-        LoggingConfig, PubkyConfig, RateLimitsConfig, RuntimeConfig, RuntimeEnvironment,
-        SecretsConfig, WorkerConfig,
+        AuthorityRevalidationConfig, ContentLocksConfig, DatabaseConfig,
+        LockServerCredentialsConfig, LockServerRuntimeConfig, LoggingConfig, PubkyConfig,
+        RateLimitsConfig, RuntimeConfig, RuntimeEnvironment, SecretsConfig, WorkerConfig,
     },
 };
 
@@ -100,6 +100,7 @@ impl TestServerApp {
             pkdns: crate::config::PkdnsConfig::default(),
             rate_limits: RateLimitsConfig::default(),
             content_locks: ContentLocksConfig::default(),
+            authority_revalidation: AuthorityRevalidationConfig::default(),
             paykit: None,
         }
     }
@@ -202,6 +203,7 @@ mod tests {
                 max_requests: 0,
                 window_seconds: 0,
             },
+            ..RateLimitsConfig::default()
         };
         let app = TestServerApp::new_in_memory(config);
         let key = VerificationSubmissionRateLimitKey {

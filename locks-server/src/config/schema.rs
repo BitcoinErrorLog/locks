@@ -24,6 +24,7 @@ pub struct LockServerRuntimeConfig {
     pub pkdns: PkdnsConfig,
     pub rate_limits: RateLimitsConfig,
     pub content_locks: ContentLocksConfig,
+    pub authority_revalidation: AuthorityRevalidationConfig,
     pub paykit: Option<PaykitConfig>,
 }
 
@@ -196,6 +197,61 @@ pub struct RuntimeConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RateLimitsConfig {
     pub verification_submission: VerificationSubmissionRateLimitConfig,
+    pub public_authority_status: PublicAuthorityStatusRateLimitConfig,
+    /// `X-Forwarded-For` hops trusted from the right. Zero uses the TCP peer.
+    /// On Railway this is [`crate::client_address::RAILWAY_TRUSTED_PROXY_HOPS`]: the
+    /// rightmost hop is the proxy Railway appends, and the hop before it is the client.
+    pub trusted_proxy_hops: u32,
+}
+
+/// Anonymous `GET /creators/{creator}/authority-status` admission limit.
+///
+/// The default window admits a Shop settings page, a reload, and a few extra tabs
+/// without refusing a person, and still stops one client from reading the route in a loop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublicAuthorityStatusRateLimitConfig {
+    pub enabled: bool,
+    pub max_requests: u32,
+    pub window_seconds: u64,
+}
+
+impl Default for PublicAuthorityStatusRateLimitConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_requests: 120,
+            window_seconds: 60,
+        }
+    }
+}
+
+/// Background pass that re-runs the real authority check on stale rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthorityRevalidationConfig {
+    pub enabled: bool,
+    /// Rows whose last real check is older than this are due.
+    pub stale_after_hours: u64,
+    /// Creators contacted per pass.
+    pub batch_size: u32,
+    /// Homeserver checks in flight during a pass.
+    pub concurrency: u32,
+    /// Delay between starting checks in one pass.
+    pub stagger_ms: u64,
+    /// Delay between passes.
+    pub poll_interval_seconds: u64,
+}
+
+impl Default for AuthorityRevalidationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            stale_after_hours: 6,
+            batch_size: 4,
+            concurrency: 1,
+            stagger_ms: 1_000,
+            poll_interval_seconds: 60,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -318,6 +374,22 @@ pub enum ConfigError {
         "rate_limits.verification_submission.window_seconds must be greater than zero when enabled"
     )]
     InvalidVerificationSubmissionRateLimitWindow,
+    #[error(
+        "rate_limits.public_authority_status.max_requests must be greater than zero when enabled"
+    )]
+    InvalidPublicAuthorityStatusRateLimitMaxRequests,
+    #[error(
+        "rate_limits.public_authority_status.window_seconds must be greater than zero when enabled"
+    )]
+    InvalidPublicAuthorityStatusRateLimitWindow,
+    #[error("authority_revalidation.stale_after_hours must be greater than zero when enabled")]
+    InvalidAuthorityRevalidationStaleAfter,
+    #[error("authority_revalidation.batch_size must be greater than zero when enabled")]
+    InvalidAuthorityRevalidationBatchSize,
+    #[error("authority_revalidation.concurrency must be greater than zero when enabled")]
+    InvalidAuthorityRevalidationConcurrency,
+    #[error("authority_revalidation.poll_interval_seconds must be greater than zero when enabled")]
+    InvalidAuthorityRevalidationPollInterval,
     #[error("content_locks.max_resource_bytes must be greater than zero")]
     InvalidMaxResourceBytes,
     #[error("content_locks.max_resources must be greater than zero")]

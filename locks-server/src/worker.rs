@@ -253,9 +253,9 @@ mod tests {
 
     use crate::app_state::{AppState, SystemClock};
     use crate::config::{
-        ContentLocksConfig, DatabaseConfig, LockServerCredentialsConfig, LockServerRuntimeConfig,
-        LoggingConfig, PubkyConfig, RateLimitsConfig, RuntimeConfig, RuntimeEnvironment,
-        SecretsConfig, WorkerConfig,
+        AuthorityRevalidationConfig, ContentLocksConfig, DatabaseConfig,
+        LockServerCredentialsConfig, LockServerRuntimeConfig, LoggingConfig, PubkyConfig,
+        RateLimitsConfig, RuntimeConfig, RuntimeEnvironment, SecretsConfig, WorkerConfig,
     };
     use crate::worker::{VerificationWorker, WorkerTick, retry_delay};
 
@@ -644,6 +644,7 @@ mod tests {
             pkdns: crate::config::PkdnsConfig::default(),
             rate_limits: RateLimitsConfig::default(),
             content_locks: ContentLocksConfig::default(),
+            authority_revalidation: AuthorityRevalidationConfig::default(),
             paykit: None,
         }
     }

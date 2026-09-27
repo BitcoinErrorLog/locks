@@ -59,6 +59,17 @@ pub trait CreatorAuthorityStore: Send + Sync {
         checked_at: time::OffsetDateTime,
     ) -> Result<(), ApplicationError>;
 
+    /// Creators whose last real check is strictly before `checked_before`, oldest first.
+    ///
+    /// The last check is the later of `last_revalidated_at` and `refused_at`. A row with
+    /// neither has never been checked and is due. `limit` is the maximum number of creators
+    /// returned, so one pass cannot walk the whole table.
+    async fn list_creator_authorities_checked_before(
+        &self,
+        checked_before: time::OffsetDateTime,
+        limit: u32,
+    ) -> Result<Vec<CreatorPubky>, ApplicationError>;
+
     /// Ensures the creator authority record is absent.
     async fn delete_creator_authority(
         &self,

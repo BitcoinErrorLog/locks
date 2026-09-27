@@ -631,6 +631,10 @@ Retry-After: <seconds>
 
 This is an abuse guard only. It does not replace proof-bundle idempotency/conflict checks, entitlement lifetime, credential TTL, or lock-type-specific policy.
 
+`GET /creators/{creator}/authority-status` has its own per-client window, default 120 requests per 60 seconds. Behind Railway, omit `rate_limits.trusted_proxy_hops` so the key is the client hop in `X-Forwarded-For` (two hops from the right). The rightmost hop is the proxy Railway appends.
+
+Stored creator authority is rechecked in the background when its last real check is older than 6 hours. A pass contacts 4 creators, one at a time, with 1 second between starts, and records an honored or refused homeserver answer the same way a content or payment request does. An unreachable homeserver leaves the stored answer in place.
+
 ### 5.6. Runtime health and readiness
 
 The current Lock Server HTTP implementation exposes small operator-facing health/readiness endpoints. These are runtime/process routes, not product/domain use cases.

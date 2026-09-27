@@ -1,8 +1,9 @@
+use std::net::SocketAddr;
 use std::str::FromStr;
 
 use axum::Json;
 use axum::extract::rejection::{JsonRejection, QueryRejection};
-use axum::extract::{Path, Query, State};
+use axum::extract::{ConnectInfo, Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri, header};
 use axum::response::{Html, IntoResponse, Response};
 use locks_core::ids::CreatorPubky;
@@ -32,6 +33,7 @@ use crate::api::dtos::{
 use crate::api::errors::{ApiError, ApiErrorCode};
 use crate::api::extractors::parse_json;
 use crate::app_state::AppState;
+use crate::client_address::client_ip_from_headers;
 
 pub(super) async fn creator_authority_status_route(
     State(state): State<AppState>,
@@ -52,8 +54,27 @@ pub(super) async fn creator_authority_status_route(
 
 pub(super) async fn public_creator_authority_status_route(
     State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Path(creator): Path<String>,
 ) -> Result<Response, ApiError> {
+    let client_address = client_ip_from_headers(
+        peer.ip(),
+        state.config().rate_limits.trusted_proxy_hops,
+        &headers,
+    );
+    let decision = state
+        .public_authority_status_rate_limiter()
+        .check(client_address, state.clock().now());
+    if !decision.allowed {
+        let retry_after = decision.retry_after_seconds.unwrap_or(1).max(1);
+        return Ok((
+            StatusCode::TOO_MANY_REQUESTS,
+            [(header::RETRY_AFTER, retry_after.to_string())],
+            Json(ApiError::new(ApiErrorCode::RateLimited, "rate limit exceeded").error_response()),
+        )
+            .into_response());
+    }
     let creator = CreatorPubky::from_str(&creator)
         .map_err(|_| ApiError::new(ApiErrorCode::InvalidIdentifier, "invalid creator"))?;
     let status = get_public_creator_authority_status(

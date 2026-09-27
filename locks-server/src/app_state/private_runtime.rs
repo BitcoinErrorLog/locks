@@ -105,6 +105,40 @@ impl CreatorAuthorityStore for InMemoryCreatorAuthorityStore {
         Ok(())
     }
 
+    async fn list_creator_authorities_checked_before(
+        &self,
+        checked_before: OffsetDateTime,
+        limit: u32,
+    ) -> Result<Vec<CreatorPubky>, ApplicationError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let records = self.records.read().await;
+        let refusals = self.refusals.read().await;
+        let mut due: Vec<(Option<OffsetDateTime>, CreatorPubky)> = records
+            .values()
+            .filter_map(|record| {
+                let validity = CreatorAuthorityValidity::from_record(
+                    record,
+                    refusals.get(&record.creator).copied(),
+                );
+                validity
+                    .due_before(checked_before)
+                    .then(|| (validity.last_checked_at(), record.creator.clone()))
+            })
+            .collect();
+        due.sort_by(|left, right| {
+            left.0
+                .cmp(&right.0)
+                .then_with(|| left.1.to_string().cmp(&right.1.to_string()))
+        });
+        Ok(due
+            .into_iter()
+            .take(usize::try_from(limit).unwrap_or(usize::MAX))
+            .map(|(_, creator)| creator)
+            .collect())
+    }
+
     async fn delete_creator_authority(
         &self,
         creator: &CreatorPubky,

@@ -2,6 +2,7 @@ use std::env;
 use std::error::Error;
 
 use locks_server::api::routes::router;
+use locks_server::authority_revalidation::AuthorityRevalidationWorker;
 use locks_server::config::{FilesystemLockServerIdentityProvider, load_or_initialize_config};
 use locks_server::pkdns::LockServerKeyRepublisher;
 use locks_server::runtime::{home_dir_from_env, parse_config_arg};
@@ -24,7 +25,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let _key_republisher = LockServerKeyRepublisher::start_if_required(&config).await?;
     let state = build_runtime_state(config).await?;
     let worker_enabled = state.config().worker.enabled;
+    let revalidation_enabled = state.config().authority_revalidation.enabled;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let revalidation_handle = if revalidation_enabled {
+        let revalidation_state = state.clone();
+        let revalidation_shutdown = shutdown_rx.clone();
+        Some(tokio::spawn(async move {
+            let worker = AuthorityRevalidationWorker::from_state(&revalidation_state);
+            if let Err(error) = worker.run_until_shutdown(revalidation_shutdown).await {
+                error!(%error, "creator authority revalidation stopped with error");
+            }
+        }))
+    } else {
+        None
+    };
     let worker_handle = if worker_enabled {
         let worker_state = state.clone();
         Some(tokio::spawn(async move {
@@ -49,6 +63,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let _ = shutdown_tx.send(true);
     if let Some(worker_handle) = worker_handle {
         worker_handle.await?;
+    }
+    if let Some(revalidation_handle) = revalidation_handle {
+        revalidation_handle.await?;
     }
     Ok(())
 }

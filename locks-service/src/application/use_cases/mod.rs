@@ -14,6 +14,7 @@ pub mod register_guarded_resource;
 pub mod require_creator_authority_for_pubky_io;
 #[cfg(test)]
 mod retrieval_access_flow_tests;
+pub mod revalidate_stale_creator_authorities;
 pub mod set_lock_service_pointer;
 pub mod start_creator_connect_flow;
 pub mod submit_proof_bundle;

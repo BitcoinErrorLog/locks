@@ -24,6 +24,7 @@ pub struct LockServerRuntimeConfig {
     pub pkdns: PkdnsConfig,
     pub rate_limits: RateLimitsConfig,
     pub content_locks: ContentLocksConfig,
+    pub authority_revalidation: AuthorityRevalidationConfig,
     pub paykit: Option<PaykitConfig>,
 }
 
@@ -196,6 +197,79 @@ pub struct RuntimeConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RateLimitsConfig {
     pub verification_submission: VerificationSubmissionRateLimitConfig,
+    pub public_authority_status: PublicAuthorityStatusRateLimitConfig,
+    /// `X-Forwarded-For` hops trusted from the right. Zero, the default, leaves the public
+    /// authority-status limit off. A positive value is the only switch that turns that limit
+    /// on. Locks does not infer a hop count from `RAILWAY_ENVIRONMENT`, and it never keys
+    /// the TCP peer.
+    pub trusted_proxy_hops: u32,
+    /// When true, each public authority-status request logs its `X-Forwarded-For` hop count.
+    /// Set from `PUBKY_LOCK_LOG_FORWARDED_HOP_COUNT`. The line does not include addresses.
+    pub log_forwarded_hop_count: bool,
+}
+
+impl RateLimitsConfig {
+    /// True only when the public status window is enabled and a positive hop count is set.
+    /// Zero hops must not become a single shared TCP-peer bucket.
+    pub fn public_authority_status_limit_active(&self) -> bool {
+        self.public_authority_status.enabled && self.trusted_proxy_hops >= 1
+    }
+}
+
+/// Anonymous `GET /creators/{creator}/authority-status` admission limit.
+///
+/// The default window admits a Shop settings page, a reload, and a few extra tabs
+/// without refusing a person, and still stops one client from reading the route in a loop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublicAuthorityStatusRateLimitConfig {
+    pub enabled: bool,
+    pub max_requests: u32,
+    pub window_seconds: u64,
+}
+
+impl Default for PublicAuthorityStatusRateLimitConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_requests: 120,
+            window_seconds: 60,
+        }
+    }
+}
+
+/// Background pass that re-runs the real authority check on stale rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthorityRevalidationConfig {
+    pub enabled: bool,
+    /// Rows whose last real check is older than this are due.
+    pub stale_after_hours: u64,
+    /// Creators contacted per pass.
+    pub batch_size: u32,
+    /// Homeserver checks in flight during a pass.
+    pub concurrency: u32,
+    /// Delay between starting checks in one pass.
+    pub stagger_ms: u64,
+    /// Delay between passes.
+    pub poll_interval_seconds: u64,
+    /// First delay after a check that did not honor the authority.
+    pub retry_base_seconds: u64,
+    /// Upper bound, in hours, on that delay.
+    pub retry_cap_hours: u64,
+}
+
+impl Default for AuthorityRevalidationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            stale_after_hours: 6,
+            batch_size: 4,
+            concurrency: 1,
+            stagger_ms: 1_000,
+            poll_interval_seconds: 60,
+            retry_base_seconds: 3_600,
+            retry_cap_hours: 24,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -318,6 +392,30 @@ pub enum ConfigError {
         "rate_limits.verification_submission.window_seconds must be greater than zero when enabled"
     )]
     InvalidVerificationSubmissionRateLimitWindow,
+    #[error(
+        "rate_limits.public_authority_status.max_requests must be greater than zero when enabled"
+    )]
+    InvalidPublicAuthorityStatusRateLimitMaxRequests,
+    #[error(
+        "rate_limits.public_authority_status.window_seconds must be greater than zero when enabled"
+    )]
+    InvalidPublicAuthorityStatusRateLimitWindow,
+    #[error("authority_revalidation.stale_after_hours must be greater than zero when enabled")]
+    InvalidAuthorityRevalidationStaleAfter,
+    #[error("authority_revalidation.stale_after_hours is too large to represent as a duration")]
+    InvalidAuthorityRevalidationStaleAfterRange,
+    #[error("authority_revalidation.retry_base_seconds must be greater than zero when enabled")]
+    InvalidAuthorityRevalidationRetryBase,
+    #[error("authority_revalidation.retry_cap_hours must be greater than zero when enabled")]
+    InvalidAuthorityRevalidationRetryCap,
+    #[error("authority_revalidation.retry_cap_hours is too large to represent as a duration")]
+    InvalidAuthorityRevalidationRetryCapRange,
+    #[error("authority_revalidation.batch_size must be greater than zero when enabled")]
+    InvalidAuthorityRevalidationBatchSize,
+    #[error("authority_revalidation.concurrency must be greater than zero when enabled")]
+    InvalidAuthorityRevalidationConcurrency,
+    #[error("authority_revalidation.poll_interval_seconds must be greater than zero when enabled")]
+    InvalidAuthorityRevalidationPollInterval,
     #[error("content_locks.max_resource_bytes must be greater than zero")]
     InvalidMaxResourceBytes,
     #[error("content_locks.max_resources must be greater than zero")]

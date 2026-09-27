@@ -13,9 +13,10 @@ use crate::app_state::pubky_clients::{
 };
 use crate::app_state::{AppState, OsRandomTaskIdGenerator, RuntimeStorageKind};
 use crate::config::{
-    ContentLocksConfig, DatabaseConfig, LockServerCredentialsConfig, LockServerRuntimeConfig,
-    LoggingConfig, PubkyConfig, PubkyNetwork, PubkyResolution, RateLimitsConfig, RuntimeConfig,
-    RuntimeEnvironment, SecretsConfig, VerificationSubmissionRateLimitConfig, WorkerConfig,
+    AuthorityRevalidationConfig, ContentLocksConfig, DatabaseConfig, LockServerCredentialsConfig,
+    LockServerRuntimeConfig, LoggingConfig, PubkyConfig, PubkyNetwork, PubkyResolution,
+    RateLimitsConfig, RuntimeConfig, RuntimeEnvironment, SecretsConfig,
+    VerificationSubmissionRateLimitConfig, WorkerConfig,
 };
 use crate::rate_limit::VerificationSubmissionRateLimitKey;
 use locks_service::application::errors::ApplicationError;
@@ -350,6 +351,7 @@ fn test_config() -> LockServerRuntimeConfig {
         pkdns: crate::config::PkdnsConfig::default(),
         rate_limits: RateLimitsConfig::default(),
         content_locks: ContentLocksConfig::default(),
+        authority_revalidation: AuthorityRevalidationConfig::default(),
         paykit: None,
     }
 }
@@ -366,6 +368,7 @@ fn test_config_with_rate_limit(
             max_requests,
             window_seconds,
         },
+        ..RateLimitsConfig::default()
     };
     config
 }

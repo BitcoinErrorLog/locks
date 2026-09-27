@@ -70,7 +70,9 @@ use crate::app_state::pubky_clients::{
 pub use crate::app_state::readiness::RuntimeStorageKind;
 use crate::config::{LockServerRuntimeConfig, load_lock_server_signing_keypair};
 use crate::paykit_http_client::{PaykitHttpClient, PaykitSetupStatusProvider};
-use crate::rate_limit::InMemoryVerificationSubmissionRateLimiter;
+use crate::rate_limit::{
+    InMemoryPublicAuthorityStatusRateLimiter, InMemoryVerificationSubmissionRateLimiter,
+};
 
 #[async_trait]
 pub trait ReaderPubkyResolver: Send + Sync {
@@ -250,6 +252,7 @@ pub struct AppState {
     clock: Arc<dyn Clock>,
     access_credential_policy: AccessCredentialPolicy,
     verification_submission_rate_limiter: Arc<InMemoryVerificationSubmissionRateLimiter>,
+    public_authority_status_rate_limiter: Arc<InMemoryPublicAuthorityStatusRateLimiter>,
     reader_pubky_resolver: Arc<dyn ReaderPubkyResolver>,
     paykit_http_client: Option<Arc<PaykitHttpClient>>,
     paykit_setup_status_provider: Option<Arc<dyn PaykitSetupStatusProvider>>,
@@ -279,6 +282,10 @@ impl std::fmt::Debug for AppState {
             .field(
                 "verification_submission_rate_limiter",
                 &self.verification_submission_rate_limiter,
+            )
+            .field(
+                "public_authority_status_rate_limiter",
+                &self.public_authority_status_rate_limiter,
             )
             .finish_non_exhaustive()
     }
@@ -561,6 +568,10 @@ impl AppState {
             Arc::new(InMemoryVerificationSubmissionRateLimiter::new(
                 config.rate_limits.verification_submission.clone(),
             ));
+        let public_authority_status_rate_limiter =
+            Arc::new(InMemoryPublicAuthorityStatusRateLimiter::new(
+                config.rate_limits.public_authority_status.clone(),
+            ));
         let reader_pubky_resolver = Arc::new(PubkyReaderPubkyResolver {
             client: build_pubky_client(&config.pubky),
         });
@@ -610,6 +621,7 @@ impl AppState {
             clock: Arc::new(SystemClock),
             access_credential_policy,
             verification_submission_rate_limiter,
+            public_authority_status_rate_limiter,
             reader_pubky_resolver,
             paykit_http_client,
             paykit_setup_status_provider,
@@ -754,6 +766,12 @@ impl AppState {
         &self,
     ) -> &Arc<InMemoryVerificationSubmissionRateLimiter> {
         &self.verification_submission_rate_limiter
+    }
+
+    pub fn public_authority_status_rate_limiter(
+        &self,
+    ) -> &Arc<InMemoryPublicAuthorityStatusRateLimiter> {
+        &self.public_authority_status_rate_limiter
     }
 
     pub fn reader_pubky_resolver(&self) -> &Arc<dyn ReaderPubkyResolver> {

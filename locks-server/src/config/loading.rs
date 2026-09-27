@@ -3,12 +3,13 @@ use std::path::{Path, PathBuf};
 use super::defaults::{DEFAULT_CONFIG_FILE, DEFAULT_SECRET_FILE, DEFAULT_SERVICE_HOME};
 use super::raw::RawConfig;
 use super::schema::{
-    ConfigError, ConfigPathResolution, ContentLocksConfig, CreatorAuthorityAcquisitionConfig,
-    DatabaseConfig, LockServerCredentialsConfig, LockServerRuntimeConfig, LoggingConfig,
-    PaykitConfig, PkdnsConfig, PubkyConfig, RateLimitsConfig, RuntimeConfig, RuntimeEnvironment,
-    SecretsConfig, WorkerConfig,
+    AuthorityRevalidationConfig, ConfigError, ConfigPathResolution, ContentLocksConfig,
+    CreatorAuthorityAcquisitionConfig, DatabaseConfig, LockServerCredentialsConfig,
+    LockServerRuntimeConfig, LoggingConfig, PaykitConfig, PkdnsConfig, PubkyConfig,
+    RateLimitsConfig, RuntimeConfig, RuntimeEnvironment, SecretsConfig, WorkerConfig,
 };
 use super::secrets::{LockServerIdentityProvider, parse_lock_server_keypair_seed};
+use crate::client_address::resolve_trusted_proxy_hops;
 
 pub fn resolve_config_path(
     custom_config_path: Option<PathBuf>,
@@ -146,8 +147,17 @@ fn initialize_default_config(
         logging: LoggingConfig::default(),
         pubky: PubkyConfig::default(),
         pkdns: PkdnsConfig::default(),
-        rate_limits: RateLimitsConfig::default(),
+        rate_limits: RateLimitsConfig {
+            trusted_proxy_hops: resolve_trusted_proxy_hops(
+                None,
+                std::env::var_os("RAILWAY_ENVIRONMENT").is_some(),
+            ),
+            log_forwarded_hop_count:
+                crate::client_address::forwarded_hop_count_log_enabled_from_env(),
+            ..RateLimitsConfig::default()
+        },
         content_locks: ContentLocksConfig::default(),
+        authority_revalidation: AuthorityRevalidationConfig::default(),
         paykit: Some(PaykitConfig {
             server_url: "http://127.0.0.1:3001".to_owned(),
             minimum_confirmations: 0,
@@ -210,10 +220,28 @@ public_icann_http_port = {} # Public HTTP port advertised for ICANN/HTTP access.
 icann_domain = "{}" # ICANN DNS name advertised for HTTP access. Local default is localhost; production should be the public hostname.
 key_republisher_interval_seconds = {} # How often the server republishes identity records. Lower improves recovery from relay loss; higher reduces background traffic.
 
+[rate_limits]
+# trusted_proxy_hops = 2 # X-Forwarded-For hops trusted from the right. Leave this unset until a deploy log shows the hop count. Unset or 0 keeps the public authority-status limit off. A short or missing chain is not limited and is not keyed to the TCP peer. X-Real-IP is ignored. Set PUBKY_LOCK_LOG_FORWARDED_HOP_COUNT=1 and read the hop-count line, which contains no addresses.
+
 [rate_limits.verification_submission]
 enabled = {} # true limits proof-bundle submissions per creator/client window; false disables this abuse control.
 max_requests = {} # Maximum verification submissions allowed per rate-limit window.
 window_seconds = {} # Rate-limit window size in seconds.
+
+[rate_limits.public_authority_status]
+enabled = {} # true applies the public authority-status window once trusted_proxy_hops is positive; false keeps that limit off. Unset hops also keep it off, so the TCP peer is never one shared bucket.
+max_requests = {} # Requests one client may make per window. The default covers Shop settings reloads without refusing a person.
+window_seconds = {} # Rate-limit window size in seconds.
+
+[authority_revalidation]
+enabled = {} # true periodically rechecks stored creator authority; false leaves revocation visible only after the next real request.
+stale_after_hours = {} # Re-run the real authority check when the last one is older than this many hours.
+batch_size = {} # Creators contacted per pass. Keep this small so a pass cannot walk every homeserver.
+concurrency = {} # Homeserver checks in flight during one pass.
+stagger_ms = {} # Delay between starting checks in one pass, so a pass does not burst a homeserver.
+poll_interval_seconds = {} # Delay between passes.
+retry_base_seconds = {} # First delay after a check that did not honor the authority. Later failures double it.
+retry_cap_hours = {} # Upper bound, in hours, on that delay. Unreachable and refused rows wait at most this long.
 
 [content_locks]
 max_resource_bytes = {} # Maximum bytes for one guarded resource upload. Raise for larger files; lower to cap memory/storage exposure.
@@ -257,6 +285,17 @@ max_total_resource_bytes = {} # Maximum combined bytes across resources in one c
         config.rate_limits.verification_submission.enabled,
         config.rate_limits.verification_submission.max_requests,
         config.rate_limits.verification_submission.window_seconds,
+        config.rate_limits.public_authority_status.enabled,
+        config.rate_limits.public_authority_status.max_requests,
+        config.rate_limits.public_authority_status.window_seconds,
+        config.authority_revalidation.enabled,
+        config.authority_revalidation.stale_after_hours,
+        config.authority_revalidation.batch_size,
+        config.authority_revalidation.concurrency,
+        config.authority_revalidation.stagger_ms,
+        config.authority_revalidation.poll_interval_seconds,
+        config.authority_revalidation.retry_base_seconds,
+        config.authority_revalidation.retry_cap_hours,
         config.content_locks.max_resource_bytes,
         config.content_locks.max_resources,
         config.content_locks.max_total_resource_bytes

@@ -16,9 +16,10 @@ use locks_core::verification::{Proof, SUBMITTED_PROOF_BUNDLE_VERSION, SubmittedP
 use locks_server::api::routes::router;
 use locks_server::app_state::AppState;
 use locks_server::config::{
-    ContentLocksConfig, CreatorAuthorityAcquisitionConfig, DatabaseConfig,
-    LockServerCredentialsConfig, LockServerRuntimeConfig, LoggingConfig, PkdnsConfig, PubkyConfig,
-    RateLimitsConfig, RuntimeConfig, RuntimeEnvironment, SecretsConfig, WorkerConfig,
+    AuthorityRevalidationConfig, ContentLocksConfig, CreatorAuthorityAcquisitionConfig,
+    DatabaseConfig, LockServerCredentialsConfig, LockServerRuntimeConfig, LoggingConfig,
+    PkdnsConfig, PubkyConfig, RateLimitsConfig, RuntimeConfig, RuntimeEnvironment, SecretsConfig,
+    WorkerConfig,
 };
 use locks_server::worker::{VerificationWorker, WorkerTick};
 use locks_service::application::models::{
@@ -274,6 +275,7 @@ fn test_config() -> LockServerRuntimeConfig {
         pubky: PubkyConfig::default(),
         pkdns: PkdnsConfig::default(),
         content_locks: ContentLocksConfig::default(),
+        authority_revalidation: AuthorityRevalidationConfig::default(),
         paykit: None,
     }
 }

@@ -1,11 +1,36 @@
 use std::collections::HashMap;
+use std::fmt;
 use std::net::IpAddr;
 use std::sync::Mutex;
 
 use locks_core::ids::CreatorPubky;
 use time::OffsetDateTime;
 
-use crate::config::VerificationSubmissionRateLimitConfig;
+use crate::client_address::rate_limit_bucket;
+use crate::config::{
+    PublicAuthorityStatusRateLimitConfig, RateLimitsConfig, VerificationSubmissionRateLimitConfig,
+};
+
+/// Startup warning when the public status limit cannot key a client.
+/// A missing hop count must not fall through to the shared TCP peer.
+pub fn warn_if_public_authority_status_limit_inactive(limits: &RateLimitsConfig) {
+    if limits.public_authority_status_limit_active() {
+        return;
+    }
+    if limits.trusted_proxy_hops == 0 {
+        tracing::warn!(
+            "public authority status rate limit is off; set rate_limits.trusted_proxy_hops after verifying the X-Forwarded-For hop count. The limit does not key the TCP peer"
+        );
+        return;
+    }
+    tracing::warn!(
+        trusted_proxy_hops = limits.trusted_proxy_hops,
+        "public authority status rate limit is off because rate_limits.public_authority_status.enabled is false"
+    );
+}
+
+/// Upper bound on tracked public-status clients. Expired windows are dropped first.
+pub const PUBLIC_AUTHORITY_STATUS_MAX_WINDOWS: usize = 4_096;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct VerificationSubmissionRateLimitKey {
@@ -72,6 +97,116 @@ impl InMemoryVerificationSubmissionRateLimiter {
     }
 }
 
+/// Per-client limiter for anonymous creator authority status reads.
+pub struct InMemoryPublicAuthorityStatusRateLimiter {
+    config: PublicAuthorityStatusRateLimitConfig,
+    windows: Mutex<HashMap<IpAddr, WindowCounter>>,
+    max_windows: usize,
+}
+
+impl fmt::Debug for InMemoryPublicAuthorityStatusRateLimiter {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let tracked = self
+            .windows
+            .lock()
+            .map(|windows| windows.len())
+            .unwrap_or(0);
+        formatter
+            .debug_struct("InMemoryPublicAuthorityStatusRateLimiter")
+            .field("enabled", &self.config.enabled)
+            .field("max_requests", &self.config.max_requests)
+            .field("window_seconds", &self.config.window_seconds)
+            .field("max_windows", &self.max_windows)
+            .field("tracked_clients", &tracked)
+            .finish()
+    }
+}
+
+impl InMemoryPublicAuthorityStatusRateLimiter {
+    pub fn new(config: PublicAuthorityStatusRateLimitConfig) -> Self {
+        Self::with_max_windows(config, PUBLIC_AUTHORITY_STATUS_MAX_WINDOWS)
+    }
+
+    pub fn with_max_windows(
+        config: PublicAuthorityStatusRateLimitConfig,
+        max_windows: usize,
+    ) -> Self {
+        Self {
+            config,
+            windows: Mutex::new(HashMap::new()),
+            max_windows: max_windows.max(1),
+        }
+    }
+
+    pub fn tracked_clients(&self) -> usize {
+        self.windows
+            .lock()
+            .expect("rate limiter mutex poisoned")
+            .len()
+    }
+
+    pub fn check(&self, client_address: IpAddr, now: OffsetDateTime) -> RateLimitDecision {
+        if !self.config.enabled {
+            return RateLimitDecision::allowed();
+        }
+        let client_address = rate_limit_bucket(client_address);
+
+        let mut windows = self.windows.lock().expect("rate limiter mutex poisoned");
+        if let Some(window) = windows.get_mut(&client_address) {
+            if window_has_expired(window.started_at, now, self.config.window_seconds) {
+                window.started_at = now;
+                window.count = 0;
+            }
+            if window.count < self.config.max_requests {
+                window.count += 1;
+                return RateLimitDecision::allowed();
+            }
+            return RateLimitDecision::rejected(retry_after_seconds(
+                window.started_at,
+                now,
+                self.config.window_seconds,
+            ));
+        }
+
+        evict_public_status_windows(
+            &mut windows,
+            now,
+            self.config.window_seconds,
+            self.max_windows,
+        );
+        windows.insert(
+            client_address,
+            WindowCounter {
+                started_at: now,
+                count: 1,
+            },
+        );
+        RateLimitDecision::allowed()
+    }
+}
+
+fn evict_public_status_windows(
+    windows: &mut HashMap<IpAddr, WindowCounter>,
+    now: OffsetDateTime,
+    window_seconds: u64,
+    max_windows: usize,
+) {
+    if windows.len() < max_windows {
+        return;
+    }
+    windows.retain(|_, window| !window_has_expired(window.started_at, now, window_seconds));
+    while windows.len() >= max_windows {
+        let oldest = windows
+            .iter()
+            .min_by_key(|(_, window)| window.started_at)
+            .map(|(address, _)| *address);
+        let Some(oldest) = oldest else {
+            break;
+        };
+        windows.remove(&oldest);
+    }
+}
+
 impl RateLimitDecision {
     fn allowed() -> Self {
         Self {
@@ -116,8 +251,106 @@ mod tests {
     use locks_core::ids::CreatorPubky;
     use time::macros::datetime;
 
-    use super::{InMemoryVerificationSubmissionRateLimiter, VerificationSubmissionRateLimitKey};
-    use crate::config::VerificationSubmissionRateLimitConfig;
+    use super::{
+        InMemoryPublicAuthorityStatusRateLimiter, InMemoryVerificationSubmissionRateLimiter,
+        VerificationSubmissionRateLimitKey, warn_if_public_authority_status_limit_inactive,
+    };
+    use crate::config::{
+        PublicAuthorityStatusRateLimitConfig, RateLimitsConfig,
+        VerificationSubmissionRateLimitConfig,
+    };
+
+    #[test]
+    fn the_public_status_limit_is_off_without_a_positive_hop_count() {
+        assert!(!RateLimitsConfig::default().public_authority_status_limit_active());
+        let enabled_without_hops = RateLimitsConfig {
+            public_authority_status: PublicAuthorityStatusRateLimitConfig {
+                enabled: true,
+                max_requests: 120,
+                window_seconds: 60,
+            },
+            trusted_proxy_hops: 0,
+            ..RateLimitsConfig::default()
+        };
+        assert!(!enabled_without_hops.public_authority_status_limit_active());
+        let enabled_with_hops = RateLimitsConfig {
+            trusted_proxy_hops: 2,
+            ..enabled_without_hops
+        };
+        assert!(enabled_with_hops.public_authority_status_limit_active());
+        let disabled = RateLimitsConfig {
+            public_authority_status: PublicAuthorityStatusRateLimitConfig {
+                enabled: false,
+                max_requests: 120,
+                window_seconds: 60,
+            },
+            ..enabled_with_hops
+        };
+        assert!(!disabled.public_authority_status_limit_active());
+    }
+
+    #[test]
+    fn startup_warns_when_the_public_status_limit_is_off_and_names_no_address() {
+        let (writer, buf) = SharedBuf::new();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .with_writer(writer)
+            .without_time()
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            warn_if_public_authority_status_limit_inactive(&RateLimitsConfig::default());
+        });
+        let text = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(text.contains("public authority status rate limit is off"));
+        assert!(!text.contains("203.0.113"));
+        assert!(!text.contains("10.0.0.1"));
+
+        let (writer, buf) = SharedBuf::new();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .with_writer(writer)
+            .without_time()
+            .finish();
+        let active = RateLimitsConfig {
+            trusted_proxy_hops: 2,
+            ..RateLimitsConfig::default()
+        };
+        tracing::subscriber::with_default(subscriber, || {
+            warn_if_public_authority_status_limit_inactive(&active);
+        });
+        assert!(buf.lock().unwrap().is_empty());
+    }
+
+    #[derive(Clone)]
+    struct SharedBuf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl SharedBuf {
+        fn new() -> (Self, std::sync::Arc<std::sync::Mutex<Vec<u8>>>) {
+            let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            (Self(std::sync::Arc::clone(&buf)), buf)
+        }
+    }
+
+    impl std::io::Write for SharedBuf {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("log buffer").extend_from_slice(data);
+            Ok(data.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedBuf {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
 
     #[test]
     fn allows_requests_under_limit() {
@@ -214,6 +447,55 @@ mod tests {
         assert!(limiter.check(&first_client, now).allowed);
         assert!(!limiter.check(&first_client, now).allowed);
         assert!(limiter.check(&second_client, now).allowed);
+    }
+
+    #[test]
+    fn public_status_windows_stay_within_the_cap() {
+        let limiter = InMemoryPublicAuthorityStatusRateLimiter::with_max_windows(
+            PublicAuthorityStatusRateLimitConfig {
+                enabled: true,
+                max_requests: 1,
+                window_seconds: 60,
+            },
+            2,
+        );
+        let now = datetime!(2026-06-03 12:00:00 UTC);
+        assert!(
+            limiter
+                .check(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1)), now)
+                .allowed
+        );
+        assert!(
+            limiter
+                .check(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 2)), now)
+                .allowed
+        );
+        assert!(
+            limiter
+                .check(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 3)), now)
+                .allowed
+        );
+        assert_eq!(limiter.tracked_clients(), 2);
+        let rendered = format!("{limiter:?}");
+        assert!(!rendered.contains("203.0.113"));
+        assert!(rendered.contains("tracked_clients"));
+    }
+
+    #[test]
+    fn public_status_ipv6_keys_share_a_64() {
+        let limiter =
+            InMemoryPublicAuthorityStatusRateLimiter::new(PublicAuthorityStatusRateLimitConfig {
+                enabled: true,
+                max_requests: 1,
+                window_seconds: 60,
+            });
+        let now = datetime!(2026-06-03 12:00:00 UTC);
+        let left: IpAddr = "2001:db8:1:2::1".parse().unwrap();
+        let right: IpAddr = "2001:db8:1:2::abcd".parse().unwrap();
+        let other: IpAddr = "2001:db8:1:3::1".parse().unwrap();
+        assert!(limiter.check(left, now).allowed);
+        assert!(!limiter.check(right, now).allowed);
+        assert!(limiter.check(other, now).allowed);
     }
 
     fn limiter(

@@ -1151,6 +1151,15 @@ mod tests {
             Ok(())
         }
 
+        async fn list_creator_authorities_due_for_recheck(
+            &self,
+            _now: time::OffsetDateTime,
+            _stale_before: time::OffsetDateTime,
+            _limit: u32,
+        ) -> Result<Vec<crate::application::ports::DueCreatorAuthority>, ApplicationError> {
+            Ok(Vec::new())
+        }
+
         async fn delete_creator_authority(
             &self,
             _creator: &CreatorPubky,

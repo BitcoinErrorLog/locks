@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use locks_core::ids::CreatorPubky;
@@ -12,9 +13,9 @@ use locks_service::application::{
     },
     ports::{
         AccessCredentialStore, CreatorAuthorityManager, CreatorAuthorityStore,
-        CreatorConnectFlowStore, FrontendSessionCodeStore, FrontendSessionStore,
-        GrantCreatorConnectFlowClient, LegacyCreatorConnectFlowClient, VerificationTaskClaimer,
-        VerificationTaskRepository,
+        CreatorConnectFlowStore, DueCreatorAuthority, FrontendSessionCodeStore,
+        FrontendSessionStore, GrantCreatorConnectFlowClient, LegacyCreatorConnectFlowClient,
+        VerificationTaskClaimer, VerificationTaskRepository,
     },
 };
 use time::OffsetDateTime;
@@ -38,6 +39,8 @@ pub(super) struct PrivateRuntimeAdapters {
 pub(super) struct InMemoryCreatorAuthorityStore {
     records: Arc<RwLock<HashMap<CreatorPubky, CreatorAuthorityRecord>>>,
     refusals: Arc<RwLock<HashMap<CreatorPubky, OffsetDateTime>>>,
+    schedules: Arc<RwLock<HashMap<CreatorPubky, (OffsetDateTime, u32)>>>,
+    lease: Arc<AtomicBool>,
 }
 
 impl InMemoryCreatorAuthorityStore {
@@ -53,6 +56,7 @@ impl CreatorAuthorityStore for InMemoryCreatorAuthorityStore {
         authority: CreatorAuthorityRecord,
     ) -> Result<(), ApplicationError> {
         self.refusals.write().await.remove(&authority.creator);
+        self.schedules.write().await.remove(&authority.creator);
         self.records
             .write()
             .await
@@ -94,6 +98,7 @@ impl CreatorAuthorityStore for InMemoryCreatorAuthorityStore {
             CreatorAuthorityCheckOutcome::Honored => {
                 record.last_revalidated_at = Some(checked_at);
                 self.refusals.write().await.remove(creator);
+                self.schedules.write().await.remove(creator);
             }
             CreatorAuthorityCheckOutcome::Refused => {
                 self.refusals
@@ -105,12 +110,91 @@ impl CreatorAuthorityStore for InMemoryCreatorAuthorityStore {
         Ok(())
     }
 
+    async fn list_creator_authorities_due_for_recheck(
+        &self,
+        now: OffsetDateTime,
+        stale_before: OffsetDateTime,
+        limit: u32,
+    ) -> Result<Vec<DueCreatorAuthority>, ApplicationError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let records = self.records.read().await;
+        let refusals = self.refusals.read().await;
+        let schedules = self.schedules.read().await;
+        let mut due: Vec<(
+            Option<OffsetDateTime>,
+            Option<OffsetDateTime>,
+            DueCreatorAuthority,
+        )> = records
+            .values()
+            .filter_map(|record| {
+                let validity = CreatorAuthorityValidity::from_record(
+                    record,
+                    refusals.get(&record.creator).copied(),
+                );
+                let scheduled = schedules.get(&record.creator).copied();
+                let next_check_at = scheduled.map(|(at, _)| at);
+                let failure_count = scheduled.map(|(_, count)| count).unwrap_or(0);
+                validity
+                    .recheck_due(next_check_at, now, stale_before)
+                    .then(|| {
+                        (
+                            next_check_at,
+                            validity.last_checked_at(),
+                            DueCreatorAuthority {
+                                creator: record.creator.clone(),
+                                failure_count,
+                            },
+                        )
+                    })
+            })
+            .collect();
+        due.sort_by(|left, right| {
+            left.0
+                .cmp(&right.0)
+                .then_with(|| left.1.cmp(&right.1))
+                .then_with(|| left.2.creator.to_string().cmp(&right.2.creator.to_string()))
+        });
+        Ok(due
+            .into_iter()
+            .take(usize::try_from(limit).unwrap_or(usize::MAX))
+            .map(|(_, _, candidate)| candidate)
+            .collect())
+    }
+
+    async fn schedule_creator_authority_recheck(
+        &self,
+        creator: &CreatorPubky,
+        next_check_at: OffsetDateTime,
+        failure_count: u32,
+    ) -> Result<(), ApplicationError> {
+        self.schedules
+            .write()
+            .await
+            .insert(creator.clone(), (next_check_at, failure_count));
+        Ok(())
+    }
+
+    async fn try_acquire_revalidation_lease(&self) -> Result<bool, ApplicationError> {
+        Ok(self
+            .lease
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok())
+    }
+
+    async fn release_revalidation_lease(&self) -> Result<(), ApplicationError> {
+        self.lease.store(false, Ordering::Release);
+        Ok(())
+    }
+
     async fn delete_creator_authority(
         &self,
         creator: &CreatorPubky,
     ) -> Result<(), ApplicationError> {
         self.records.write().await.remove(creator);
         self.refusals.write().await.remove(creator);
+        self.schedules.write().await.remove(creator);
         Ok(())
     }
 }

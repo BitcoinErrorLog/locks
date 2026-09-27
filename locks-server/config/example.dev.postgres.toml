@@ -52,10 +52,28 @@ public_icann_http_port = 80
 icann_domain = "localhost"
 key_republisher_interval_seconds = 3600
 
+[rate_limits]
+# trusted_proxy_hops = 2 # Leave unset until PUBKY_LOCK_LOG_FORWARDED_HOP_COUNT=1 shows the hop count. Unset or 0 keeps the public status limit off. The TCP peer is never the key. X-Real-IP is ignored.
+
 [rate_limits.verification_submission]
 enabled = true
 max_requests = 60
 window_seconds = 60
+
+[rate_limits.public_authority_status]
+enabled = true
+max_requests = 120
+window_seconds = 60
+
+[authority_revalidation]
+enabled = true
+stale_after_hours = 6
+batch_size = 4
+concurrency = 1
+stagger_ms = 1000
+poll_interval_seconds = 60
+retry_base_seconds = 3600
+retry_cap_hours = 24
 
 [content_locks]
 max_resource_bytes = 10_000_000

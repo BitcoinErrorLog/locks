@@ -58,6 +58,7 @@ Gated-off routes are plain Axum `404 Not Found` responses because the route is i
 | `DELETE /frontend-sessions/current` | `204` empty response | Requires `Authorization: Bearer <frontend_session_token>`. Mounted with creator authority acquisition. | Token is request-only and is deleted from the frontend session store. | `401 frontend_session_unavailable`, `401 frontend_session_expired`, `404` when route gated off |
 | `GET /.well-known/locks-server` | `200` JSON service identity | Public. Always mounted. CORS-enabled. | No secrets. Used by browser SDK to verify service, API version, and Lock Server Pubky identity. | n/a |
 | `GET /creator/authority-status` | `200` JSON secret-free authority status | Requires `Authorization: Bearer <frontend_session_token>`. Creator is derived from the frontend session. | Response contains only creator, boolean status, auth kind, scopes, and optional expiry; no tokens, codes, authorization URLs, secrets, or DB/config values. | `401 frontend_session_unavailable`, `401 frontend_session_expired`, `404` only if route absent in older deployments |
+| `GET /creators/{creator}/authority-status` | `200` JSON `{creator, authorized}` | Public. No bearer. `Cache-Control: no-store`. | No secrets. The answer is recorded validity only. | `400 invalid_identifier`, `429 rate_limited` |
 | `GET /creator/paykit/setup-status` | `200` JSON coarse Paykit setup status | Requires `Authorization: Bearer <frontend_session_token>`. Creator is derived from the session; query/body Creator input is rejected. | Response contains only `status`; Paykit URL, HTTP status, authority details, credentials, and internal failures are never exposed. | `401 frontend_session_unavailable`, `401 frontend_session_expired`; authenticated Paykit failures return `200 {"status":"unavailable"}` |
 | `POST /proof-bundles` | `200` JSON lifecycle | Public viewer route. A new `paykit-payment` lifecycle identity requires `[paykit]` runtime config; an exact persisted replay does not. | No bearer secrets, invoice data, or raw proof material in response. | `400 invalid_request`, `409 task_state_conflict`, `422 unsupported_verifier_type`, `422 paykit_not_configured`, `422 reader_pubky_unresolvable`, `429 rate_limited`, `502 paykit_invoice_creation_failed` |
 | `POST /verification-task-lookups` | `200` JSON lifecycle | Public viewer route. | No bearer secrets in response. | `400 invalid_request`, `404 verification_task_not_found` |
@@ -107,7 +108,7 @@ Stable error codes and statuses mirror `locks-server/src/api/errors.rs` tests:
 | `unsupported_verifier_type` | 422 | Proof references a verifier unavailable in the current runtime. |
 | `paykit_not_configured` | 422 | A `paykit-payment` proof was submitted to a Lock Server without a `[paykit]` runtime section. |
 | `reader_pubky_unresolvable` | 422 | A `paykit-payment` proof had a syntactically valid `reader_public_key` that could not be resolved to a Pubky homeserver/PKARR record before invoice creation. |
-| `rate_limited` | 429 | Submission exceeded configured rate limits. |
+| `rate_limited` | 429 | A configured admission limit was exceeded. `Retry-After` is the remaining window in seconds. |
 | `payload_too_large` | 413 | Raw guarded-resource upload exceeded `[content_locks].max_resource_bytes`. |
 | `paykit_invoice_creation_failed` | 502 | Lock Server could not create the Paykit invoice; no verification task is created. |
 | `internal_error` | 500 | Unexpected server-side failure. |
@@ -257,6 +258,31 @@ Error cases:
 
 - Missing/malformed frontend session bearer: `401 frontend_session_unavailable`.
 - Expired frontend session: `401 frontend_session_expired`.
+
+### `GET /creators/{creator}/authority-status`
+
+Public read of the same recorded-validity rule, without a frontend session and without a homeserver call. `authorized` is true when a row exists, `refused_at` is null, and any `session_expires_at` is still in the future.
+
+```http
+GET /creators/{creator}/authority-status
+```
+
+```json
+{
+  "creator": "pubkycreator123",
+  "authorized": true
+}
+```
+
+Success sets `Cache-Control: no-store`. An invalid creator is `400 invalid_identifier`. The body is only `creator` and `authorized`.
+
+The per-client limit is off until `rate_limits.trusted_proxy_hops` is a positive `X-Forwarded-For` hop count and `rate_limits.public_authority_status.enabled` is true. Startup logs a warning while it is off. The TCP peer is never the key, so one caller cannot exhaust a bucket shared by every client behind the same proxy. A missing, short, or unparseable chain is not limited. `X-Real-IP` is never the key. `RAILWAY_ENVIRONMENT` does not select a hop count.
+
+Once the hop count is set, the window is 120 requests per 60 seconds by default. Over the limit the response is `429` with `Retry-After`, `Cache-Control: no-store`, and `error.code = rate_limited`. The tracked window map is capped. IPv6 keys are the `/64` prefix. The key is the Nth `X-Forwarded-For` hop from the right.
+
+To read the hop count on a running server, set `PUBKY_LOCK_LOG_FORWARDED_HOP_COUNT=1` and request this route. The process logs `forwarded_hop_count` and does not log the addresses. Unset the variable after the count is confirmed. A paykit-server Railway capture on 2026-09-22 saw two hops (`client, railway-hop`). This service has no such capture, so it does not infer that count.
+
+A revoked authority stays `authorized: true` until the next real check records the refusal. One replica at a time rechecks due rows. A row is due at its `next_check_at`, or, when it has no schedule, when its last honored or refused check is older than `authority_revalidation.stale_after_hours` (default 6). A check that does not honor the authority, including a refusal or an unreachable homeserver, waits `retry_base_seconds` (default 1 hour) and doubles that delay up to `retry_cap_hours` (default 24). An honored check is due again after `stale_after_hours`.
 
 ## Paykit setup readiness route
 

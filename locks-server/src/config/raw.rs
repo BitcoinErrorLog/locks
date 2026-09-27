@@ -9,13 +9,15 @@ use url::Url;
 
 use super::defaults::{DEFAULT_CREATOR_AUTHORITY_KEY_ENV, PUBLIC_KEY_PLACEHOLDER};
 use super::schema::{
-    ConfigError, ContentLocksConfig, CreatorAuthorityAcquisitionConfig,
-    CreatorAuthorityAcquisitionMethod, DatabaseConfig, GrantConnectAcquisitionConfig,
-    LegacyConnectAcquisitionConfig, LockServerCredentialsConfig, LockServerRuntimeConfig,
-    LoggingConfig, PAYKIT_REQUEST_TIMEOUT_SECONDS, PaykitConfig, PkdnsConfig, PubkyConfig,
-    PubkyNetwork, PubkyResolution, RateLimitsConfig, RuntimeConfig, RuntimeEnvironment,
-    SecretsConfig, VerificationSubmissionRateLimitConfig, WorkerConfig,
+    AuthorityRevalidationConfig, ConfigError, ContentLocksConfig,
+    CreatorAuthorityAcquisitionConfig, CreatorAuthorityAcquisitionMethod, DatabaseConfig,
+    GrantConnectAcquisitionConfig, LegacyConnectAcquisitionConfig, LockServerCredentialsConfig,
+    LockServerRuntimeConfig, LoggingConfig, PAYKIT_REQUEST_TIMEOUT_SECONDS, PaykitConfig,
+    PkdnsConfig, PubkyConfig, PubkyNetwork, PubkyResolution, PublicAuthorityStatusRateLimitConfig,
+    RateLimitsConfig, RuntimeConfig, RuntimeEnvironment, SecretsConfig,
+    VerificationSubmissionRateLimitConfig, WorkerConfig,
 };
+use crate::client_address::resolve_trusted_proxy_hops;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -37,6 +39,8 @@ pub(super) struct RawConfig {
     pkdns: RawPkdnsConfig,
     #[serde(default)]
     rate_limits: RawRateLimitsConfig,
+    #[serde(default)]
+    authority_revalidation: RawAuthorityRevalidationConfig,
     #[serde(default)]
     content_locks: RawContentLocksConfig,
     #[serde(default)]
@@ -209,6 +213,35 @@ pkarr_relays = ["not-a-url"]
             let display = error.to_string();
             assert!(!display.contains("sentinel"));
         }
+    }
+}
+
+#[cfg(test)]
+mod authority_revalidation_tests {
+    use super::*;
+
+    #[test]
+    fn rejects_a_stale_after_that_cannot_be_a_duration() {
+        let raw = RawAuthorityRevalidationConfig {
+            stale_after_hours: u64::MAX,
+            ..RawAuthorityRevalidationConfig::default()
+        };
+        assert!(matches!(
+            raw.into_authority_revalidation_config(),
+            Err(ConfigError::InvalidAuthorityRevalidationStaleAfterRange)
+        ));
+    }
+
+    #[test]
+    fn rejects_a_retry_cap_that_cannot_be_a_duration() {
+        let raw = RawAuthorityRevalidationConfig {
+            retry_cap_hours: u64::MAX,
+            ..RawAuthorityRevalidationConfig::default()
+        };
+        assert!(matches!(
+            raw.into_authority_revalidation_config(),
+            Err(ConfigError::InvalidAuthorityRevalidationRetryCapRange)
+        ));
     }
 }
 
@@ -469,7 +502,58 @@ struct RawRuntimeConfig {
 #[derive(Debug, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 struct RawRateLimitsConfig {
+    #[serde(default)]
     verification_submission: RawVerificationSubmissionRateLimitConfig,
+    #[serde(default)]
+    public_authority_status: RawPublicAuthorityStatusRateLimitConfig,
+    #[serde(default)]
+    trusted_proxy_hops: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+struct RawPublicAuthorityStatusRateLimitConfig {
+    enabled: bool,
+    max_requests: u32,
+    window_seconds: u64,
+}
+
+impl Default for RawPublicAuthorityStatusRateLimitConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_requests: 120,
+            window_seconds: 60,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+struct RawAuthorityRevalidationConfig {
+    enabled: bool,
+    stale_after_hours: u64,
+    batch_size: u32,
+    concurrency: u32,
+    stagger_ms: u64,
+    poll_interval_seconds: u64,
+    retry_base_seconds: u64,
+    retry_cap_hours: u64,
+}
+
+impl Default for RawAuthorityRevalidationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            stale_after_hours: 6,
+            batch_size: 4,
+            concurrency: 1,
+            stagger_ms: 1_000,
+            poll_interval_seconds: 60,
+            retry_base_seconds: 3_600,
+            retry_cap_hours: 24,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -629,11 +713,86 @@ impl RawLoggingConfig {
 }
 
 impl RawRateLimitsConfig {
-    fn into_rate_limits_config(self) -> Result<RateLimitsConfig, ConfigError> {
+    fn into_rate_limits_config(
+        self,
+        railway_environment_set: bool,
+    ) -> Result<RateLimitsConfig, ConfigError> {
         Ok(RateLimitsConfig {
             verification_submission: self
                 .verification_submission
                 .into_verification_submission_rate_limit_config()?,
+            public_authority_status: self
+                .public_authority_status
+                .into_public_authority_status_rate_limit_config()?,
+            trusted_proxy_hops: resolve_trusted_proxy_hops(
+                self.trusted_proxy_hops,
+                railway_environment_set,
+            ),
+            log_forwarded_hop_count:
+                crate::client_address::forwarded_hop_count_log_enabled_from_env(),
+        })
+    }
+}
+
+impl RawPublicAuthorityStatusRateLimitConfig {
+    fn into_public_authority_status_rate_limit_config(
+        self,
+    ) -> Result<PublicAuthorityStatusRateLimitConfig, ConfigError> {
+        if self.enabled && self.max_requests == 0 {
+            return Err(ConfigError::InvalidPublicAuthorityStatusRateLimitMaxRequests);
+        }
+        if self.enabled && self.window_seconds == 0 {
+            return Err(ConfigError::InvalidPublicAuthorityStatusRateLimitWindow);
+        }
+        Ok(PublicAuthorityStatusRateLimitConfig {
+            enabled: self.enabled,
+            max_requests: self.max_requests,
+            window_seconds: self.window_seconds,
+        })
+    }
+}
+
+impl RawAuthorityRevalidationConfig {
+    fn into_authority_revalidation_config(
+        self,
+    ) -> Result<AuthorityRevalidationConfig, ConfigError> {
+        if self.enabled && self.stale_after_hours == 0 {
+            return Err(ConfigError::InvalidAuthorityRevalidationStaleAfter);
+        }
+        if self.enabled
+            && self.stale_after_hours > crate::authority_revalidation::MAX_REPRESENTABLE_HOURS
+        {
+            return Err(ConfigError::InvalidAuthorityRevalidationStaleAfterRange);
+        }
+        if self.enabled && self.retry_base_seconds == 0 {
+            return Err(ConfigError::InvalidAuthorityRevalidationRetryBase);
+        }
+        if self.enabled && self.retry_cap_hours == 0 {
+            return Err(ConfigError::InvalidAuthorityRevalidationRetryCap);
+        }
+        if self.enabled
+            && self.retry_cap_hours > crate::authority_revalidation::MAX_REPRESENTABLE_HOURS
+        {
+            return Err(ConfigError::InvalidAuthorityRevalidationRetryCapRange);
+        }
+        if self.enabled && self.batch_size == 0 {
+            return Err(ConfigError::InvalidAuthorityRevalidationBatchSize);
+        }
+        if self.enabled && self.concurrency == 0 {
+            return Err(ConfigError::InvalidAuthorityRevalidationConcurrency);
+        }
+        if self.enabled && self.poll_interval_seconds == 0 {
+            return Err(ConfigError::InvalidAuthorityRevalidationPollInterval);
+        }
+        Ok(AuthorityRevalidationConfig {
+            enabled: self.enabled,
+            stale_after_hours: self.stale_after_hours,
+            batch_size: self.batch_size,
+            concurrency: self.concurrency,
+            stagger_ms: self.stagger_ms,
+            poll_interval_seconds: self.poll_interval_seconds,
+            retry_base_seconds: self.retry_base_seconds,
+            retry_cap_hours: self.retry_cap_hours,
         })
     }
 }
@@ -670,7 +829,13 @@ impl RawConfig {
         let logging = self.logging.into_logging_config()?;
         let pubky = self.pubky.into_pubky_config()?;
         let pkdns = self.pkdns.into_pkdns_config()?;
-        let rate_limits = self.rate_limits.into_rate_limits_config()?;
+        let railway_environment_set = std::env::var_os("RAILWAY_ENVIRONMENT").is_some();
+        let rate_limits = self
+            .rate_limits
+            .into_rate_limits_config(railway_environment_set)?;
+        let authority_revalidation = self
+            .authority_revalidation
+            .into_authority_revalidation_config()?;
         let content_locks = self.content_locks.into_content_locks_config()?;
         let paykit = self
             .paykit
@@ -715,6 +880,7 @@ impl RawConfig {
             pkdns,
             rate_limits,
             content_locks,
+            authority_revalidation,
             paykit,
         })
     }

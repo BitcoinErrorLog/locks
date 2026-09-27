@@ -1,5 +1,7 @@
 pub mod api;
 pub mod app_state;
+pub mod authority_revalidation;
+pub mod client_address;
 pub mod config;
 pub mod paykit_http_client;
 pub mod pkdns;

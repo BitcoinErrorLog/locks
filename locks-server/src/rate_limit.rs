@@ -7,7 +7,27 @@ use locks_core::ids::CreatorPubky;
 use time::OffsetDateTime;
 
 use crate::client_address::rate_limit_bucket;
-use crate::config::{PublicAuthorityStatusRateLimitConfig, VerificationSubmissionRateLimitConfig};
+use crate::config::{
+    PublicAuthorityStatusRateLimitConfig, RateLimitsConfig, VerificationSubmissionRateLimitConfig,
+};
+
+/// Startup warning when the public status limit cannot key a client.
+/// A missing hop count must not fall through to the shared TCP peer.
+pub fn warn_if_public_authority_status_limit_inactive(limits: &RateLimitsConfig) {
+    if limits.public_authority_status_limit_active() {
+        return;
+    }
+    if limits.trusted_proxy_hops == 0 {
+        tracing::warn!(
+            "public authority status rate limit is off; set rate_limits.trusted_proxy_hops after verifying the X-Forwarded-For hop count. The limit does not key the TCP peer"
+        );
+        return;
+    }
+    tracing::warn!(
+        trusted_proxy_hops = limits.trusted_proxy_hops,
+        "public authority status rate limit is off because rate_limits.public_authority_status.enabled is false"
+    );
+}
 
 /// Upper bound on tracked public-status clients. Expired windows are dropped first.
 pub const PUBLIC_AUTHORITY_STATUS_MAX_WINDOWS: usize = 4_096;
@@ -233,11 +253,104 @@ mod tests {
 
     use super::{
         InMemoryPublicAuthorityStatusRateLimiter, InMemoryVerificationSubmissionRateLimiter,
-        VerificationSubmissionRateLimitKey,
+        VerificationSubmissionRateLimitKey, warn_if_public_authority_status_limit_inactive,
     };
     use crate::config::{
-        PublicAuthorityStatusRateLimitConfig, VerificationSubmissionRateLimitConfig,
+        PublicAuthorityStatusRateLimitConfig, RateLimitsConfig,
+        VerificationSubmissionRateLimitConfig,
     };
+
+    #[test]
+    fn the_public_status_limit_is_off_without_a_positive_hop_count() {
+        assert!(!RateLimitsConfig::default().public_authority_status_limit_active());
+        let enabled_without_hops = RateLimitsConfig {
+            public_authority_status: PublicAuthorityStatusRateLimitConfig {
+                enabled: true,
+                max_requests: 120,
+                window_seconds: 60,
+            },
+            trusted_proxy_hops: 0,
+            ..RateLimitsConfig::default()
+        };
+        assert!(!enabled_without_hops.public_authority_status_limit_active());
+        let enabled_with_hops = RateLimitsConfig {
+            trusted_proxy_hops: 2,
+            ..enabled_without_hops
+        };
+        assert!(enabled_with_hops.public_authority_status_limit_active());
+        let disabled = RateLimitsConfig {
+            public_authority_status: PublicAuthorityStatusRateLimitConfig {
+                enabled: false,
+                max_requests: 120,
+                window_seconds: 60,
+            },
+            ..enabled_with_hops
+        };
+        assert!(!disabled.public_authority_status_limit_active());
+    }
+
+    #[test]
+    fn startup_warns_when_the_public_status_limit_is_off_and_names_no_address() {
+        let (writer, buf) = SharedBuf::new();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .with_writer(writer)
+            .without_time()
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            warn_if_public_authority_status_limit_inactive(&RateLimitsConfig::default());
+        });
+        let text = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(text.contains("public authority status rate limit is off"));
+        assert!(!text.contains("203.0.113"));
+        assert!(!text.contains("10.0.0.1"));
+
+        let (writer, buf) = SharedBuf::new();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .with_writer(writer)
+            .without_time()
+            .finish();
+        let active = RateLimitsConfig {
+            trusted_proxy_hops: 2,
+            ..RateLimitsConfig::default()
+        };
+        tracing::subscriber::with_default(subscriber, || {
+            warn_if_public_authority_status_limit_inactive(&active);
+        });
+        assert!(buf.lock().unwrap().is_empty());
+    }
+
+    #[derive(Clone)]
+    struct SharedBuf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl SharedBuf {
+        fn new() -> (Self, std::sync::Arc<std::sync::Mutex<Vec<u8>>>) {
+            let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            (Self(std::sync::Arc::clone(&buf)), buf)
+        }
+    }
+
+    impl std::io::Write for SharedBuf {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("log buffer").extend_from_slice(data);
+            Ok(data.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedBuf {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
 
     #[test]
     fn allows_requests_under_limit() {

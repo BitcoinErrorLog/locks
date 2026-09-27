@@ -5,6 +5,7 @@ use locks_server::api::routes::router;
 use locks_server::authority_revalidation::AuthorityRevalidationWorker;
 use locks_server::config::{FilesystemLockServerIdentityProvider, load_or_initialize_config};
 use locks_server::pkdns::LockServerKeyRepublisher;
+use locks_server::rate_limit::warn_if_public_authority_status_limit_inactive;
 use locks_server::runtime::{home_dir_from_env, parse_config_arg};
 use locks_server::storage::build_runtime_state;
 use locks_server::worker::VerificationWorker;
@@ -21,6 +22,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let identity_provider = FilesystemLockServerIdentityProvider;
     let config = load_or_initialize_config(config_path, &home_dir, &identity_provider)?;
     init_tracing(&config.logging.level);
+    warn_if_public_authority_status_limit_inactive(&config.rate_limits);
     let bind_addr = config.bind_addr;
     let _key_republisher = LockServerKeyRepublisher::start_if_required(&config).await?;
     let state = build_runtime_state(config).await?;

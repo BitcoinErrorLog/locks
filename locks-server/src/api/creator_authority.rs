@@ -33,7 +33,7 @@ use crate::api::dtos::{
 use crate::api::errors::{ApiError, ApiErrorCode};
 use crate::api::extractors::parse_json;
 use crate::app_state::AppState;
-use crate::client_address::client_ip_from_headers;
+use crate::client_address::{log_forwarded_hop_count, public_status_client_key_from_headers};
 
 pub(super) async fn creator_authority_status_route(
     State(state): State<AppState>,
@@ -54,29 +54,38 @@ pub(super) async fn creator_authority_status_route(
 
 pub(super) async fn public_creator_authority_status_route(
     State(state): State<AppState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    ConnectInfo(_peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Path(creator): Path<String>,
 ) -> Result<Response, ApiError> {
-    let client_address = client_ip_from_headers(
-        peer.ip(),
-        state.config().rate_limits.trusted_proxy_hops,
-        &headers,
-    );
-    let decision = state
-        .public_authority_status_rate_limiter()
-        .check(client_address, state.clock().now());
-    if !decision.allowed {
-        let retry_after = decision.retry_after_seconds.unwrap_or(1).max(1);
-        return Ok((
-            StatusCode::TOO_MANY_REQUESTS,
-            [
-                (header::RETRY_AFTER, retry_after.to_string()),
-                (header::CACHE_CONTROL, "no-store".to_owned()),
-            ],
-            Json(ApiError::new(ApiErrorCode::RateLimited, "rate limit exceeded").error_response()),
+    log_forwarded_hop_count(state.config().rate_limits.log_forwarded_hop_count, &headers);
+    if state
+        .config()
+        .rate_limits
+        .public_authority_status_limit_active()
+        && let Some(client_address) = public_status_client_key_from_headers(
+            state.config().rate_limits.trusted_proxy_hops,
+            &headers,
         )
-            .into_response());
+    {
+        let decision = state
+            .public_authority_status_rate_limiter()
+            .check(client_address, state.clock().now());
+        if !decision.allowed {
+            let retry_after = decision.retry_after_seconds.unwrap_or(1).max(1);
+            return Ok((
+                StatusCode::TOO_MANY_REQUESTS,
+                [
+                    (header::RETRY_AFTER, retry_after.to_string()),
+                    (header::CACHE_CONTROL, "no-store".to_owned()),
+                ],
+                Json(
+                    ApiError::new(ApiErrorCode::RateLimited, "rate limit exceeded")
+                        .error_response(),
+                ),
+            )
+                .into_response());
+        }
     }
     let creator = CreatorPubky::from_str(&creator)
         .map_err(|_| ApiError::new(ApiErrorCode::InvalidIdentifier, "invalid creator"))?;

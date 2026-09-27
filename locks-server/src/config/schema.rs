@@ -198,10 +198,22 @@ pub struct RuntimeConfig {
 pub struct RateLimitsConfig {
     pub verification_submission: VerificationSubmissionRateLimitConfig,
     pub public_authority_status: PublicAuthorityStatusRateLimitConfig,
-    /// `X-Forwarded-For` hops trusted from the right. Zero, the default, uses the TCP peer.
-    /// Set this only after a header capture on this deployment. Locks does not infer a hop
-    /// count from `RAILWAY_ENVIRONMENT`.
+    /// `X-Forwarded-For` hops trusted from the right. Zero, the default, leaves the public
+    /// authority-status limit off. A positive value is the only switch that turns that limit
+    /// on. Locks does not infer a hop count from `RAILWAY_ENVIRONMENT`, and it never keys
+    /// the TCP peer.
     pub trusted_proxy_hops: u32,
+    /// When true, each public authority-status request logs its `X-Forwarded-For` hop count.
+    /// Set from `PUBKY_LOCK_LOG_FORWARDED_HOP_COUNT`. The line does not include addresses.
+    pub log_forwarded_hop_count: bool,
+}
+
+impl RateLimitsConfig {
+    /// True only when the public status window is enabled and a positive hop count is set.
+    /// Zero hops must not become a single shared TCP-peer bucket.
+    pub fn public_authority_status_limit_active(&self) -> bool {
+        self.public_authority_status.enabled && self.trusted_proxy_hops >= 1
+    }
 }
 
 /// Anonymous `GET /creators/{creator}/authority-status` admission limit.

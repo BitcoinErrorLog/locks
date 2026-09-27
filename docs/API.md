@@ -276,9 +276,11 @@ GET /creators/{creator}/authority-status
 
 Success sets `Cache-Control: no-store`. An invalid creator is `400 invalid_identifier`. The body is only `creator` and `authorized`.
 
-The route is limited per client, 120 requests per 60 seconds by default. Over the limit the response is `429` with `Retry-After`, `Cache-Control: no-store`, and `error.code = rate_limited`. The tracked window map is capped.
+The per-client limit is off until `rate_limits.trusted_proxy_hops` is a positive `X-Forwarded-For` hop count and `rate_limits.public_authority_status.enabled` is true. Startup logs a warning while it is off. The TCP peer is never the key, so one caller cannot exhaust a bucket shared by every client behind the same proxy. A missing, short, or unparseable chain is not limited. `X-Real-IP` is never the key. `RAILWAY_ENVIRONMENT` does not select a hop count.
 
-The default key is the TCP peer. `RAILWAY_ENVIRONMENT` does not change that. `X-Real-IP` is never the key. An operator who has captured the proxy chain can set `rate_limits.trusted_proxy_hops` to the Nth `X-Forwarded-For` hop from the right; a short or missing chain still uses the peer. IPv6 keys are the `/64` prefix. A paykit-server Railway capture on 2026-09-22 saw `X-Forwarded-For: client, railway-hop` and kept a spoofed leading value in the real client's bucket at two hops. This service has no such capture, so it does not infer that count.
+Once the hop count is set, the window is 120 requests per 60 seconds by default. Over the limit the response is `429` with `Retry-After`, `Cache-Control: no-store`, and `error.code = rate_limited`. The tracked window map is capped. IPv6 keys are the `/64` prefix. The key is the Nth `X-Forwarded-For` hop from the right.
+
+To read the hop count on a running server, set `PUBKY_LOCK_LOG_FORWARDED_HOP_COUNT=1` and request this route. The process logs `forwarded_hop_count` and does not log the addresses. Unset the variable after the count is confirmed. A paykit-server Railway capture on 2026-09-22 saw two hops (`client, railway-hop`). This service has no such capture, so it does not infer that count.
 
 A revoked authority stays `authorized: true` until the next real check records the refusal. One replica at a time rechecks due rows. A row is due at its `next_check_at`, or, when it has no schedule, when its last honored or refused check is older than `authority_revalidation.stale_after_hours` (default 6). A check that does not honor the authority, including a refusal or an unreachable homeserver, waits `retry_base_seconds` (default 1 hour) and doubles that delay up to `retry_cap_hours` (default 24). An honored check is due again after `stale_after_hours`.
 

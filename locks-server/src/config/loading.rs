@@ -152,6 +152,8 @@ fn initialize_default_config(
                 None,
                 std::env::var_os("RAILWAY_ENVIRONMENT").is_some(),
             ),
+            log_forwarded_hop_count:
+                crate::client_address::forwarded_hop_count_log_enabled_from_env(),
             ..RateLimitsConfig::default()
         },
         content_locks: ContentLocksConfig::default(),
@@ -219,7 +221,7 @@ icann_domain = "{}" # ICANN DNS name advertised for HTTP access. Local default i
 key_republisher_interval_seconds = {} # How often the server republishes identity records. Lower improves recovery from relay loss; higher reduces background traffic.
 
 [rate_limits]
-# trusted_proxy_hops = 2 # X-Forwarded-For hops trusted from the right. The default is 0: the TCP peer, which a client cannot spoof. Set this only after a header capture proves the proxy chain. A short or missing X-Forwarded-For uses the peer. X-Real-IP is ignored.
+# trusted_proxy_hops = 2 # X-Forwarded-For hops trusted from the right. Leave this unset until a deploy log shows the hop count. Unset or 0 keeps the public authority-status limit off. A short or missing chain is not limited and is not keyed to the TCP peer. X-Real-IP is ignored. Set PUBKY_LOCK_LOG_FORWARDED_HOP_COUNT=1 and read the hop-count line, which contains no addresses.
 
 [rate_limits.verification_submission]
 enabled = {} # true limits proof-bundle submissions per creator/client window; false disables this abuse control.
@@ -227,7 +229,7 @@ max_requests = {} # Maximum verification submissions allowed per rate-limit wind
 window_seconds = {} # Rate-limit window size in seconds.
 
 [rate_limits.public_authority_status]
-enabled = {} # true limits anonymous GET /creators/{{creator}}/authority-status per client; false disables that limit.
+enabled = {} # true applies the public authority-status window once trusted_proxy_hops is positive; false keeps that limit off. Unset hops also keep it off, so the TCP peer is never one shared bucket.
 max_requests = {} # Requests one client may make per window. The default covers Shop settings reloads without refusing a person.
 window_seconds = {} # Rate-limit window size in seconds.
 

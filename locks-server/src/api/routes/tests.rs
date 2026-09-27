@@ -2653,9 +2653,10 @@ async fn public_creator_authority_status_is_limited_per_railway_client_not_the_p
 }
 
 #[tokio::test]
-async fn public_creator_authority_status_default_limit_keys_the_peer_not_client_headers() {
+async fn public_creator_authority_status_stays_open_until_a_hop_count_is_configured() {
     let mut config = test_config(RuntimeEnvironment::Development, true);
-    assert_eq!(config.rate_limits.trusted_proxy_hops, 0);
+    assert!(!config.rate_limits.public_authority_status_limit_active());
+    config.rate_limits.public_authority_status.enabled = true;
     config.rate_limits.public_authority_status.max_requests = 1;
     config.rate_limits.public_authority_status.window_seconds = 60;
     let state = AppState::new_empty_in_memory(config);
@@ -2665,7 +2666,44 @@ async fn public_creator_authority_status_default_limit_keys_the_peer_not_client_
         "/creators/pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/authority-status";
     let peer = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
 
-    let first = app
+    for (forwarded_for, real_ip) in [
+        ("203.0.113.10, 198.51.100.7", "203.0.113.10"),
+        ("192.0.2.9, 198.51.100.8", "203.0.113.99"),
+        ("198.51.100.7", "203.0.113.10"),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(peer_status_request(uri, peer, forwarded_for, real_ip))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+}
+
+#[tokio::test]
+async fn a_short_forwarded_chain_does_not_share_one_bucket() {
+    let mut config = test_config(RuntimeEnvironment::Development, true);
+    config.rate_limits.trusted_proxy_hops = 2;
+    config.rate_limits.public_authority_status.enabled = true;
+    config.rate_limits.public_authority_status.max_requests = 1;
+    config.rate_limits.public_authority_status.window_seconds = 60;
+    let state = AppState::new_empty_in_memory(config);
+    seed_creator_authority(&state).await;
+    let app = router(state);
+    let uri =
+        "/creators/pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/authority-status";
+    let peer = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+
+    for real_ip in ["203.0.113.10", "203.0.113.11"] {
+        let response = app
+            .clone()
+            .oneshot(peer_status_request(uri, peer, "198.51.100.7", real_ip))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    let first_client = app
         .clone()
         .oneshot(peer_status_request(
             uri,
@@ -2675,30 +2713,17 @@ async fn public_creator_authority_status_default_limit_keys_the_peer_not_client_
         ))
         .await
         .unwrap();
-    assert_eq!(first.status(), StatusCode::OK);
-
-    let spoofed_headers = app
-        .clone()
+    assert_eq!(first_client.status(), StatusCode::OK);
+    let limited = app
         .oneshot(peer_status_request(
             uri,
             peer,
-            "192.0.2.9, 198.51.100.8",
-            "203.0.113.99",
+            "192.0.2.9, 203.0.113.10, 198.51.100.7",
+            "192.0.2.9",
         ))
         .await
         .unwrap();
-    assert_eq!(spoofed_headers.status(), StatusCode::TOO_MANY_REQUESTS);
-
-    let other_peer = app
-        .oneshot(peer_status_request(
-            uri,
-            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
-            "203.0.113.99",
-            "203.0.113.99",
-        ))
-        .await
-        .unwrap();
-    assert_eq!(other_peer.status(), StatusCode::OK);
+    assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
 }
 
 fn peer_status_request(

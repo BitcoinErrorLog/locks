@@ -728,6 +728,8 @@ impl RawRateLimitsConfig {
                 self.trusted_proxy_hops,
                 railway_environment_set,
             ),
+            log_forwarded_hop_count:
+                crate::client_address::forwarded_hop_count_log_enabled_from_env(),
         })
     }
 }

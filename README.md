@@ -631,7 +631,7 @@ Retry-After: <seconds>
 
 This is an abuse guard only. It does not replace proof-bundle idempotency/conflict checks, entitlement lifetime, credential TTL, or lock-type-specific policy.
 
-`GET /creators/{creator}/authority-status` has its own per-client window, default 120 requests per 60 seconds. The key is the TCP peer unless `rate_limits.trusted_proxy_hops` is set. `X-Real-IP` is not a key. IPv6 clients share a `/64`. The window map is capped, and a `429` is `Cache-Control: no-store`.
+`GET /creators/{creator}/authority-status` does not rate-limit until `rate_limits.trusted_proxy_hops` is a positive `X-Forwarded-For` hop count. The TCP peer is not a key. Startup warns while the limit is off. Set `PUBKY_LOCK_LOG_FORWARDED_HOP_COUNT=1` to log that hop count, with no addresses in the line, then set `trusted_proxy_hops` to the count the deploy recorded. A short chain is not limited. `X-Real-IP` is not a key. IPv6 clients share a `/64`. The window map is capped, and a `429` is `Cache-Control: no-store`. The default window, once the limit is on, is 120 requests per 60 seconds.
 
 One server replica rechecks stored creator authority at a time. A row with no schedule is due when its last honored or refused check is older than 6 hours. A check that does not honor the authority waits an hour, then twice that, up to 24 hours, so an unreachable homeserver cannot fill every batch. An honored check is due again after 6 hours. A pass contacts 4 creators, one at a time, with 1 second between starts.
 

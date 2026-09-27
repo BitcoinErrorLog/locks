@@ -216,6 +216,35 @@ pkarr_relays = ["not-a-url"]
     }
 }
 
+#[cfg(test)]
+mod authority_revalidation_tests {
+    use super::*;
+
+    #[test]
+    fn rejects_a_stale_after_that_cannot_be_a_duration() {
+        let raw = RawAuthorityRevalidationConfig {
+            stale_after_hours: u64::MAX,
+            ..RawAuthorityRevalidationConfig::default()
+        };
+        assert!(matches!(
+            raw.into_authority_revalidation_config(),
+            Err(ConfigError::InvalidAuthorityRevalidationStaleAfterRange)
+        ));
+    }
+
+    #[test]
+    fn rejects_a_retry_cap_that_cannot_be_a_duration() {
+        let raw = RawAuthorityRevalidationConfig {
+            retry_cap_hours: u64::MAX,
+            ..RawAuthorityRevalidationConfig::default()
+        };
+        assert!(matches!(
+            raw.into_authority_revalidation_config(),
+            Err(ConfigError::InvalidAuthorityRevalidationRetryCapRange)
+        ));
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawPkdnsConfig {
@@ -508,6 +537,8 @@ struct RawAuthorityRevalidationConfig {
     concurrency: u32,
     stagger_ms: u64,
     poll_interval_seconds: u64,
+    retry_base_seconds: u64,
+    retry_cap_hours: u64,
 }
 
 impl Default for RawAuthorityRevalidationConfig {
@@ -519,6 +550,8 @@ impl Default for RawAuthorityRevalidationConfig {
             concurrency: 1,
             stagger_ms: 1_000,
             poll_interval_seconds: 60,
+            retry_base_seconds: 3_600,
+            retry_cap_hours: 24,
         }
     }
 }
@@ -724,6 +757,22 @@ impl RawAuthorityRevalidationConfig {
         if self.enabled && self.stale_after_hours == 0 {
             return Err(ConfigError::InvalidAuthorityRevalidationStaleAfter);
         }
+        if self.enabled
+            && self.stale_after_hours > crate::authority_revalidation::MAX_REPRESENTABLE_HOURS
+        {
+            return Err(ConfigError::InvalidAuthorityRevalidationStaleAfterRange);
+        }
+        if self.enabled && self.retry_base_seconds == 0 {
+            return Err(ConfigError::InvalidAuthorityRevalidationRetryBase);
+        }
+        if self.enabled && self.retry_cap_hours == 0 {
+            return Err(ConfigError::InvalidAuthorityRevalidationRetryCap);
+        }
+        if self.enabled
+            && self.retry_cap_hours > crate::authority_revalidation::MAX_REPRESENTABLE_HOURS
+        {
+            return Err(ConfigError::InvalidAuthorityRevalidationRetryCapRange);
+        }
         if self.enabled && self.batch_size == 0 {
             return Err(ConfigError::InvalidAuthorityRevalidationBatchSize);
         }
@@ -740,6 +789,8 @@ impl RawAuthorityRevalidationConfig {
             concurrency: self.concurrency,
             stagger_ms: self.stagger_ms,
             poll_interval_seconds: self.poll_interval_seconds,
+            retry_base_seconds: self.retry_base_seconds,
+            retry_cap_hours: self.retry_cap_hours,
         })
     }
 }

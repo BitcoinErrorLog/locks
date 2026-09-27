@@ -631,9 +631,9 @@ Retry-After: <seconds>
 
 This is an abuse guard only. It does not replace proof-bundle idempotency/conflict checks, entitlement lifetime, credential TTL, or lock-type-specific policy.
 
-`GET /creators/{creator}/authority-status` has its own per-client window, default 120 requests per 60 seconds. Behind Railway, omit `rate_limits.trusted_proxy_hops` so the key is the client hop in `X-Forwarded-For` (two hops from the right). The rightmost hop is the proxy Railway appends.
+`GET /creators/{creator}/authority-status` has its own per-client window, default 120 requests per 60 seconds. The key is the TCP peer unless `rate_limits.trusted_proxy_hops` is set. `X-Real-IP` is not a key. IPv6 clients share a `/64`. The window map is capped, and a `429` is `Cache-Control: no-store`.
 
-Stored creator authority is rechecked in the background when its last real check is older than 6 hours. A pass contacts 4 creators, one at a time, with 1 second between starts, and records an honored or refused homeserver answer the same way a content or payment request does. An unreachable homeserver leaves the stored answer in place.
+One server replica rechecks stored creator authority at a time. A row with no schedule is due when its last honored or refused check is older than 6 hours. A check that does not honor the authority waits an hour, then twice that, up to 24 hours, so an unreachable homeserver cannot fill every batch. An honored check is due again after 6 hours. A pass contacts 4 creators, one at a time, with 1 second between starts.
 
 ### 5.6. Runtime health and readiness
 

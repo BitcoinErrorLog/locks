@@ -1,11 +1,16 @@
 use std::collections::HashMap;
+use std::fmt;
 use std::net::IpAddr;
 use std::sync::Mutex;
 
 use locks_core::ids::CreatorPubky;
 use time::OffsetDateTime;
 
+use crate::client_address::rate_limit_bucket;
 use crate::config::{PublicAuthorityStatusRateLimitConfig, VerificationSubmissionRateLimitConfig};
+
+/// Upper bound on tracked public-status clients. Expired windows are dropped first.
+pub const PUBLIC_AUTHORITY_STATUS_MAX_WINDOWS: usize = 4_096;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct VerificationSubmissionRateLimitKey {
@@ -73,46 +78,112 @@ impl InMemoryVerificationSubmissionRateLimiter {
 }
 
 /// Per-client limiter for anonymous creator authority status reads.
-#[derive(Debug)]
 pub struct InMemoryPublicAuthorityStatusRateLimiter {
     config: PublicAuthorityStatusRateLimitConfig,
     windows: Mutex<HashMap<IpAddr, WindowCounter>>,
+    max_windows: usize,
+}
+
+impl fmt::Debug for InMemoryPublicAuthorityStatusRateLimiter {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let tracked = self
+            .windows
+            .lock()
+            .map(|windows| windows.len())
+            .unwrap_or(0);
+        formatter
+            .debug_struct("InMemoryPublicAuthorityStatusRateLimiter")
+            .field("enabled", &self.config.enabled)
+            .field("max_requests", &self.config.max_requests)
+            .field("window_seconds", &self.config.window_seconds)
+            .field("max_windows", &self.max_windows)
+            .field("tracked_clients", &tracked)
+            .finish()
+    }
 }
 
 impl InMemoryPublicAuthorityStatusRateLimiter {
     pub fn new(config: PublicAuthorityStatusRateLimitConfig) -> Self {
+        Self::with_max_windows(config, PUBLIC_AUTHORITY_STATUS_MAX_WINDOWS)
+    }
+
+    pub fn with_max_windows(
+        config: PublicAuthorityStatusRateLimitConfig,
+        max_windows: usize,
+    ) -> Self {
         Self {
             config,
             windows: Mutex::new(HashMap::new()),
+            max_windows: max_windows.max(1),
         }
+    }
+
+    pub fn tracked_clients(&self) -> usize {
+        self.windows
+            .lock()
+            .expect("rate limiter mutex poisoned")
+            .len()
     }
 
     pub fn check(&self, client_address: IpAddr, now: OffsetDateTime) -> RateLimitDecision {
         if !self.config.enabled {
             return RateLimitDecision::allowed();
         }
+        let client_address = rate_limit_bucket(client_address);
 
         let mut windows = self.windows.lock().expect("rate limiter mutex poisoned");
-        let window = windows.entry(client_address).or_insert(WindowCounter {
-            started_at: now,
-            count: 0,
-        });
-
-        if window_has_expired(window.started_at, now, self.config.window_seconds) {
-            window.started_at = now;
-            window.count = 0;
+        if let Some(window) = windows.get_mut(&client_address) {
+            if window_has_expired(window.started_at, now, self.config.window_seconds) {
+                window.started_at = now;
+                window.count = 0;
+            }
+            if window.count < self.config.max_requests {
+                window.count += 1;
+                return RateLimitDecision::allowed();
+            }
+            return RateLimitDecision::rejected(retry_after_seconds(
+                window.started_at,
+                now,
+                self.config.window_seconds,
+            ));
         }
 
-        if window.count < self.config.max_requests {
-            window.count += 1;
-            return RateLimitDecision::allowed();
-        }
-
-        RateLimitDecision::rejected(retry_after_seconds(
-            window.started_at,
+        evict_public_status_windows(
+            &mut windows,
             now,
             self.config.window_seconds,
-        ))
+            self.max_windows,
+        );
+        windows.insert(
+            client_address,
+            WindowCounter {
+                started_at: now,
+                count: 1,
+            },
+        );
+        RateLimitDecision::allowed()
+    }
+}
+
+fn evict_public_status_windows(
+    windows: &mut HashMap<IpAddr, WindowCounter>,
+    now: OffsetDateTime,
+    window_seconds: u64,
+    max_windows: usize,
+) {
+    if windows.len() < max_windows {
+        return;
+    }
+    windows.retain(|_, window| !window_has_expired(window.started_at, now, window_seconds));
+    while windows.len() >= max_windows {
+        let oldest = windows
+            .iter()
+            .min_by_key(|(_, window)| window.started_at)
+            .map(|(address, _)| *address);
+        let Some(oldest) = oldest else {
+            break;
+        };
+        windows.remove(&oldest);
     }
 }
 
@@ -160,8 +231,13 @@ mod tests {
     use locks_core::ids::CreatorPubky;
     use time::macros::datetime;
 
-    use super::{InMemoryVerificationSubmissionRateLimiter, VerificationSubmissionRateLimitKey};
-    use crate::config::VerificationSubmissionRateLimitConfig;
+    use super::{
+        InMemoryPublicAuthorityStatusRateLimiter, InMemoryVerificationSubmissionRateLimiter,
+        VerificationSubmissionRateLimitKey,
+    };
+    use crate::config::{
+        PublicAuthorityStatusRateLimitConfig, VerificationSubmissionRateLimitConfig,
+    };
 
     #[test]
     fn allows_requests_under_limit() {
@@ -258,6 +334,55 @@ mod tests {
         assert!(limiter.check(&first_client, now).allowed);
         assert!(!limiter.check(&first_client, now).allowed);
         assert!(limiter.check(&second_client, now).allowed);
+    }
+
+    #[test]
+    fn public_status_windows_stay_within_the_cap() {
+        let limiter = InMemoryPublicAuthorityStatusRateLimiter::with_max_windows(
+            PublicAuthorityStatusRateLimitConfig {
+                enabled: true,
+                max_requests: 1,
+                window_seconds: 60,
+            },
+            2,
+        );
+        let now = datetime!(2026-06-03 12:00:00 UTC);
+        assert!(
+            limiter
+                .check(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1)), now)
+                .allowed
+        );
+        assert!(
+            limiter
+                .check(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 2)), now)
+                .allowed
+        );
+        assert!(
+            limiter
+                .check(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 3)), now)
+                .allowed
+        );
+        assert_eq!(limiter.tracked_clients(), 2);
+        let rendered = format!("{limiter:?}");
+        assert!(!rendered.contains("203.0.113"));
+        assert!(rendered.contains("tracked_clients"));
+    }
+
+    #[test]
+    fn public_status_ipv6_keys_share_a_64() {
+        let limiter =
+            InMemoryPublicAuthorityStatusRateLimiter::new(PublicAuthorityStatusRateLimitConfig {
+                enabled: true,
+                max_requests: 1,
+                window_seconds: 60,
+            });
+        let now = datetime!(2026-06-03 12:00:00 UTC);
+        let left: IpAddr = "2001:db8:1:2::1".parse().unwrap();
+        let right: IpAddr = "2001:db8:1:2::abcd".parse().unwrap();
+        let other: IpAddr = "2001:db8:1:3::1".parse().unwrap();
+        assert!(limiter.check(left, now).allowed);
+        assert!(!limiter.check(right, now).allowed);
+        assert!(limiter.check(other, now).allowed);
     }
 
     fn limiter(

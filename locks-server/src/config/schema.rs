@@ -198,9 +198,9 @@ pub struct RuntimeConfig {
 pub struct RateLimitsConfig {
     pub verification_submission: VerificationSubmissionRateLimitConfig,
     pub public_authority_status: PublicAuthorityStatusRateLimitConfig,
-    /// `X-Forwarded-For` hops trusted from the right. Zero uses the TCP peer.
-    /// On Railway this is [`crate::client_address::RAILWAY_TRUSTED_PROXY_HOPS`]: the
-    /// rightmost hop is the proxy Railway appends, and the hop before it is the client.
+    /// `X-Forwarded-For` hops trusted from the right. Zero, the default, uses the TCP peer.
+    /// Set this only after a header capture on this deployment. Locks does not infer a hop
+    /// count from `RAILWAY_ENVIRONMENT`.
     pub trusted_proxy_hops: u32,
 }
 
@@ -239,6 +239,10 @@ pub struct AuthorityRevalidationConfig {
     pub stagger_ms: u64,
     /// Delay between passes.
     pub poll_interval_seconds: u64,
+    /// First delay after a check that did not honor the authority.
+    pub retry_base_seconds: u64,
+    /// Upper bound, in hours, on that delay.
+    pub retry_cap_hours: u64,
 }
 
 impl Default for AuthorityRevalidationConfig {
@@ -250,6 +254,8 @@ impl Default for AuthorityRevalidationConfig {
             concurrency: 1,
             stagger_ms: 1_000,
             poll_interval_seconds: 60,
+            retry_base_seconds: 3_600,
+            retry_cap_hours: 24,
         }
     }
 }
@@ -384,6 +390,14 @@ pub enum ConfigError {
     InvalidPublicAuthorityStatusRateLimitWindow,
     #[error("authority_revalidation.stale_after_hours must be greater than zero when enabled")]
     InvalidAuthorityRevalidationStaleAfter,
+    #[error("authority_revalidation.stale_after_hours is too large to represent as a duration")]
+    InvalidAuthorityRevalidationStaleAfterRange,
+    #[error("authority_revalidation.retry_base_seconds must be greater than zero when enabled")]
+    InvalidAuthorityRevalidationRetryBase,
+    #[error("authority_revalidation.retry_cap_hours must be greater than zero when enabled")]
+    InvalidAuthorityRevalidationRetryCap,
+    #[error("authority_revalidation.retry_cap_hours is too large to represent as a duration")]
+    InvalidAuthorityRevalidationRetryCapRange,
     #[error("authority_revalidation.batch_size must be greater than zero when enabled")]
     InvalidAuthorityRevalidationBatchSize,
     #[error("authority_revalidation.concurrency must be greater than zero when enabled")]

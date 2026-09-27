@@ -70,7 +70,10 @@ pub(super) async fn public_creator_authority_status_route(
         let retry_after = decision.retry_after_seconds.unwrap_or(1).max(1);
         return Ok((
             StatusCode::TOO_MANY_REQUESTS,
-            [(header::RETRY_AFTER, retry_after.to_string())],
+            [
+                (header::RETRY_AFTER, retry_after.to_string()),
+                (header::CACHE_CONTROL, "no-store".to_owned()),
+            ],
             Json(ApiError::new(ApiErrorCode::RateLimited, "rate limit exceeded").error_response()),
         )
             .into_response());

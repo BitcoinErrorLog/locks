@@ -1,4 +1,5 @@
 use std::str::FromStr;
+use std::sync::Arc;
 use std::{fmt, str};
 
 use async_trait::async_trait;
@@ -18,13 +19,29 @@ use crate::application::models::{
     CreatorAuthorityAuthKind, CreatorAuthorityCheckOutcome, CreatorAuthorityRecord,
     CreatorAuthoritySecret, CreatorAuthorityValidity,
 };
-use crate::application::ports::CreatorAuthorityStore;
+use crate::application::ports::{CreatorAuthorityStore, DueCreatorAuthority};
+use tokio::sync::Mutex;
+
+/// `pg_try_advisory_lock` key for the authority recheck sweep. One session per database holds it.
+const AUTHORITY_REVALIDATION_LOCK_KEY: i64 = 0x4C4B_535F_4155_5452;
 
 /// Postgres-backed store for creator-granted homeserver authority secrets.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct PostgresCreatorAuthorityStore {
     pool: PgPool,
     cipher: Option<CreatorAuthoritySecretCipher>,
+    revalidation_lease: Arc<Mutex<Option<sqlx::pool::PoolConnection<sqlx::Postgres>>>>,
+}
+
+impl fmt::Debug for PostgresCreatorAuthorityStore {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PostgresCreatorAuthorityStore")
+            .field("pool", &self.pool)
+            .field("cipher", &self.cipher)
+            .field("revalidation_lease", &"advisory")
+            .finish()
+    }
 }
 
 /// Encrypts/decrypts creator authority secret material before Postgres persistence.
@@ -122,7 +139,11 @@ impl CreatorAuthoritySecretCipher {
 impl PostgresCreatorAuthorityStore {
     /// Creates a store backed by the provided migrated Postgres pool.
     pub fn new(pool: PgPool) -> Self {
-        Self { pool, cipher: None }
+        Self {
+            pool,
+            cipher: None,
+            revalidation_lease: Arc::new(Mutex::new(None)),
+        }
     }
 
     /// Creates a store that encrypts creator authority secrets before persistence.
@@ -130,6 +151,7 @@ impl PostgresCreatorAuthorityStore {
         Self {
             pool,
             cipher: Some(cipher),
+            revalidation_lease: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -164,6 +186,8 @@ impl CreatorAuthorityStore for PostgresCreatorAuthorityStore {
                 session_expires_at = EXCLUDED.session_expires_at,
                 last_revalidated_at = EXCLUDED.last_revalidated_at,
                 refused_at = NULL,
+                next_check_at = NULL,
+                check_failure_count = 0,
                 updated_at = now()",
         )
         .bind(authority.creator.to_string())
@@ -235,7 +259,11 @@ impl CreatorAuthorityStore for PostgresCreatorAuthorityStore {
         let query = match outcome {
             CreatorAuthorityCheckOutcome::Honored => {
                 "UPDATE creator_authorities
-                SET last_revalidated_at = $2, refused_at = NULL, updated_at = now()
+                SET last_revalidated_at = $2,
+                    refused_at = NULL,
+                    next_check_at = NULL,
+                    check_failure_count = 0,
+                    updated_at = now()
                 WHERE creator = $1"
             }
             CreatorAuthorityCheckOutcome::Refused => {
@@ -253,26 +281,35 @@ impl CreatorAuthorityStore for PostgresCreatorAuthorityStore {
         Ok(())
     }
 
-    async fn list_creator_authorities_checked_before(
+    async fn list_creator_authorities_due_for_recheck(
         &self,
-        checked_before: time::OffsetDateTime,
+        now: time::OffsetDateTime,
+        stale_before: time::OffsetDateTime,
         limit: u32,
-    ) -> Result<Vec<CreatorPubky>, ApplicationError> {
+    ) -> Result<Vec<DueCreatorAuthority>, ApplicationError> {
         if limit == 0 {
             return Ok(Vec::new());
         }
         let rows = sqlx::query(
-            "SELECT creator
+            "SELECT creator, check_failure_count
             FROM creator_authorities
-            WHERE COALESCE(last_revalidated_at, '-infinity'::timestamptz) < $1
-              AND COALESCE(refused_at, '-infinity'::timestamptz) < $1
-            ORDER BY GREATEST(
-                COALESCE(last_revalidated_at, '-infinity'::timestamptz),
-                COALESCE(refused_at, '-infinity'::timestamptz)
-            ), creator
-            LIMIT $2",
+            WHERE (
+                next_check_at IS NOT NULL AND next_check_at <= $1
+            ) OR (
+                next_check_at IS NULL
+                AND COALESCE(last_revalidated_at, '-infinity'::timestamptz) < $2
+                AND COALESCE(refused_at, '-infinity'::timestamptz) < $2
+            )
+            ORDER BY COALESCE(next_check_at, '-infinity'::timestamptz),
+                GREATEST(
+                    COALESCE(last_revalidated_at, '-infinity'::timestamptz),
+                    COALESCE(refused_at, '-infinity'::timestamptz)
+                ),
+                creator
+            LIMIT $3",
         )
-        .bind(checked_before)
+        .bind(now)
+        .bind(stale_before)
         .bind(i64::from(limit))
         .fetch_all(&self.pool)
         .await
@@ -281,11 +318,73 @@ impl CreatorAuthorityStore for PostgresCreatorAuthorityStore {
         rows.into_iter()
             .map(|row| {
                 let creator: String = row.try_get("creator").map_err(storage_error)?;
-                CreatorPubky::from_str(&creator).map_err(|error| ApplicationError::Storage {
-                    message: format!("stored creator authority has an invalid creator: {error}"),
+                let creator = CreatorPubky::from_str(&creator).map_err(|error| {
+                    ApplicationError::Storage {
+                        message: format!(
+                            "stored creator authority has an invalid creator: {error}"
+                        ),
+                    }
+                })?;
+                let failure_count: i32 =
+                    row.try_get("check_failure_count").map_err(storage_error)?;
+                Ok(DueCreatorAuthority {
+                    creator,
+                    failure_count: u32::try_from(failure_count.max(0)).unwrap_or(u32::MAX),
                 })
             })
             .collect()
+    }
+
+    async fn schedule_creator_authority_recheck(
+        &self,
+        creator: &CreatorPubky,
+        next_check_at: time::OffsetDateTime,
+        failure_count: u32,
+    ) -> Result<(), ApplicationError> {
+        let failure_count = i32::try_from(failure_count).unwrap_or(i32::MAX);
+        sqlx::query(
+            "UPDATE creator_authorities
+            SET next_check_at = $2, check_failure_count = $3, updated_at = now()
+            WHERE creator = $1",
+        )
+        .bind(creator.to_string())
+        .bind(next_check_at)
+        .bind(failure_count)
+        .execute(&self.pool)
+        .await
+        .map_err(storage_error)?;
+        Ok(())
+    }
+
+    async fn try_acquire_revalidation_lease(&self) -> Result<bool, ApplicationError> {
+        let mut lease = self.revalidation_lease.lock().await;
+        if lease.is_some() {
+            return Ok(false);
+        }
+        let mut connection = self.pool.acquire().await.map_err(storage_error)?;
+        let locked: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
+            .bind(AUTHORITY_REVALIDATION_LOCK_KEY)
+            .fetch_one(&mut *connection)
+            .await
+            .map_err(storage_error)?;
+        if !locked {
+            return Ok(false);
+        }
+        *lease = Some(connection);
+        Ok(true)
+    }
+
+    async fn release_revalidation_lease(&self) -> Result<(), ApplicationError> {
+        let mut lease = self.revalidation_lease.lock().await;
+        let Some(mut connection) = lease.take() else {
+            return Ok(());
+        };
+        sqlx::query("SELECT pg_advisory_unlock($1)")
+            .bind(AUTHORITY_REVALIDATION_LOCK_KEY)
+            .execute(&mut *connection)
+            .await
+            .map_err(storage_error)?;
+        Ok(())
     }
 
     async fn delete_creator_authority(
@@ -784,13 +883,18 @@ mod tests {
             .unwrap();
 
         let due = store
-            .list_creator_authorities_checked_before(cutoff, 10)
+            .list_creator_authorities_due_for_recheck(cutoff, cutoff, 10)
             .await
             .unwrap();
-        assert_eq!(due, vec![never.clone(), stale.clone()]);
+        assert_eq!(
+            due.iter()
+                .map(|row| row.creator.clone())
+                .collect::<Vec<_>>(),
+            vec![never.clone(), stale.clone()]
+        );
         assert!(
             store
-                .list_creator_authorities_checked_before(cutoff, 0)
+                .list_creator_authorities_due_for_recheck(cutoff, cutoff, 0)
                 .await
                 .unwrap()
                 .is_empty()
@@ -806,11 +910,54 @@ mod tests {
             .unwrap();
         assert_eq!(
             store
-                .list_creator_authorities_checked_before(cutoff, 10)
+                .list_creator_authorities_due_for_recheck(cutoff, cutoff, 10)
                 .await
-                .unwrap(),
-            vec![never]
+                .unwrap()
+                .into_iter()
+                .map(|row| row.creator)
+                .collect::<Vec<_>>(),
+            vec![never.clone()]
         );
+
+        store
+            .schedule_creator_authority_recheck(&never, datetime!(2026-09-27 18:00:00 UTC), 2)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .list_creator_authorities_due_for_recheck(cutoff, cutoff, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let due_later = store
+            .list_creator_authorities_due_for_recheck(
+                datetime!(2026-09-27 18:00:00 UTC),
+                datetime!(2026-09-27 18:00:00 UTC),
+                10,
+            )
+            .await
+            .unwrap();
+        let scheduled = due_later
+            .iter()
+            .find(|row| row.creator == never)
+            .expect("a due next_check_at selects the row");
+        assert_eq!(scheduled.failure_count, 2);
+
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn only_one_connection_holds_the_revalidation_lease() {
+        let database = TestDatabase::create().await;
+        let first = PostgresCreatorAuthorityStore::new(database.pool().clone());
+        let second = PostgresCreatorAuthorityStore::new(database.pool().clone());
+
+        assert!(first.try_acquire_revalidation_lease().await.unwrap());
+        assert!(!second.try_acquire_revalidation_lease().await.unwrap());
+        first.release_revalidation_lease().await.unwrap();
+        assert!(second.try_acquire_revalidation_lease().await.unwrap());
+        second.release_revalidation_lease().await.unwrap();
 
         database.cleanup().await;
     }

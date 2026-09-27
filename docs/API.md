@@ -276,9 +276,11 @@ GET /creators/{creator}/authority-status
 
 Success sets `Cache-Control: no-store`. An invalid creator is `400 invalid_identifier`. The body is only `creator` and `authorized`.
 
-The route is limited per client. The client is the Nth `X-Forwarded-For` hop from the right (`rate_limits.trusted_proxy_hops`). Railway appends its own address as the rightmost hop, so a Railway process that omits the key trusts 2 and keys the client the edge observed. `0` uses the TCP peer. Too few hops fall back to `X-Real-IP`, then the peer. The default limit is 120 requests per 60 seconds. Over the limit the response is `429` with `Retry-After` and `error.code = rate_limited`.
+The route is limited per client, 120 requests per 60 seconds by default. Over the limit the response is `429` with `Retry-After`, `Cache-Control: no-store`, and `error.code = rate_limited`. The tracked window map is capped.
 
-A revoked authority stays `authorized: true` until the next real check records the refusal. The background revalidation pass does that for rows whose last check is older than `authority_revalidation.stale_after_hours` (default 6).
+The default key is the TCP peer. `RAILWAY_ENVIRONMENT` does not change that. `X-Real-IP` is never the key. An operator who has captured the proxy chain can set `rate_limits.trusted_proxy_hops` to the Nth `X-Forwarded-For` hop from the right; a short or missing chain still uses the peer. IPv6 keys are the `/64` prefix. A paykit-server Railway capture on 2026-09-22 saw `X-Forwarded-For: client, railway-hop` and kept a spoofed leading value in the real client's bucket at two hops. This service has no such capture, so it does not infer that count.
+
+A revoked authority stays `authorized: true` until the next real check records the refusal. One replica at a time rechecks due rows. A row is due at its `next_check_at`, or, when it has no schedule, when its last honored or refused check is older than `authority_revalidation.stale_after_hours` (default 6). A check that does not honor the authority, including a refusal or an unreachable homeserver, waits `retry_base_seconds` (default 1 hour) and doubles that delay up to `retry_cap_hours` (default 24). An honored check is due again after `stale_after_hours`.
 
 ## Paykit setup readiness route
 

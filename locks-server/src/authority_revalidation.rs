@@ -4,7 +4,8 @@ use std::time::Duration;
 use locks_service::application::errors::ApplicationError;
 use locks_service::application::ports::{Clock, CreatorAuthorityManager, CreatorAuthorityStore};
 use locks_service::application::use_cases::revalidate_stale_creator_authorities::{
-    AuthorityRevalidationPolicy, AuthorityRevalidationReport, revalidate_stale_creator_authorities,
+    AuthorityRevalidationPolicy, AuthorityRevalidationReport,
+    revalidate_stale_creator_authorities_once,
 };
 use tokio::sync::watch;
 use tracing::{info, warn};
@@ -36,7 +37,7 @@ impl<'a> AuthorityRevalidationWorker<'a> {
     }
 
     pub async fn run_once(&self) -> Result<AuthorityRevalidationReport, ApplicationError> {
-        let report = revalidate_stale_creator_authorities(
+        let report = revalidate_stale_creator_authorities_once(
             self.store,
             Arc::clone(&self.manager),
             self.clock,
@@ -78,16 +79,31 @@ impl<'a> AuthorityRevalidationWorker<'a> {
     }
 }
 
+/// Largest hour count `time::Duration::hours` can build without panicking.
+pub const MAX_REPRESENTABLE_HOURS: u64 = (i64::MAX / 3_600) as u64;
+
+pub fn duration_from_hours(hours: u64) -> time::Duration {
+    let hours = i64::try_from(hours)
+        .unwrap_or(i64::MAX / 3_600)
+        .min(i64::MAX / 3_600);
+    time::Duration::hours(hours)
+}
+
+fn duration_from_seconds(seconds: u64) -> time::Duration {
+    let seconds = i64::try_from(seconds).unwrap_or(i64::MAX);
+    time::Duration::seconds(seconds)
+}
+
 fn policy_from_config(config: &AuthorityRevalidationConfig) -> AuthorityRevalidationPolicy {
     AuthorityRevalidationPolicy {
-        stale_after: time::Duration::hours(
-            i64::try_from(config.stale_after_hours).unwrap_or(i64::MAX),
-        ),
+        stale_after: duration_from_hours(config.stale_after_hours),
         batch_size: config.batch_size,
         concurrency: usize::try_from(config.concurrency)
             .unwrap_or(usize::MAX)
             .max(1),
         stagger: Duration::from_millis(config.stagger_ms),
+        retry_base: duration_from_seconds(config.retry_base_seconds),
+        retry_cap: duration_from_hours(config.retry_cap_hours),
     }
 }
 
@@ -101,8 +117,12 @@ mod tests {
     };
     use time::OffsetDateTime;
 
-    use super::AuthorityRevalidationWorker;
+    use super::{
+        AuthorityRevalidationWorker, MAX_REPRESENTABLE_HOURS, duration_from_hours,
+        policy_from_config,
+    };
     use crate::app_state::AppState;
+    use crate::config::AuthorityRevalidationConfig;
     use crate::testing::TestServerApp;
 
     #[tokio::test]
@@ -144,6 +164,19 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(fresh_validity.last_revalidated_at, Some(fresh_checked_at));
+    }
+
+    #[test]
+    fn a_huge_stale_after_does_not_panic() {
+        let config = AuthorityRevalidationConfig {
+            stale_after_hours: u64::MAX,
+            retry_cap_hours: u64::MAX,
+            retry_base_seconds: u64::MAX,
+            ..AuthorityRevalidationConfig::default()
+        };
+        let policy = policy_from_config(&config);
+        assert_eq!(policy.stale_after, duration_from_hours(u64::MAX));
+        assert!(policy.retry_cap <= duration_from_hours(MAX_REPRESENTABLE_HOURS));
     }
 
     fn creator(value: &str) -> CreatorPubky {

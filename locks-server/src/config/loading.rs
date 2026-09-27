@@ -219,7 +219,7 @@ icann_domain = "{}" # ICANN DNS name advertised for HTTP access. Local default i
 key_republisher_interval_seconds = {} # How often the server republishes identity records. Lower improves recovery from relay loss; higher reduces background traffic.
 
 [rate_limits]
-# trusted_proxy_hops = 2 # X-Forwarded-For hops trusted from the right. Omit this key on Railway so the server trusts 2: the rightmost hop is the proxy Railway appends, and the hop before it is the client. Set 0 to use the TCP peer.
+# trusted_proxy_hops = 2 # X-Forwarded-For hops trusted from the right. The default is 0: the TCP peer, which a client cannot spoof. Set this only after a header capture proves the proxy chain. A short or missing X-Forwarded-For uses the peer. X-Real-IP is ignored.
 
 [rate_limits.verification_submission]
 enabled = {} # true limits proof-bundle submissions per creator/client window; false disables this abuse control.
@@ -238,6 +238,8 @@ batch_size = {} # Creators contacted per pass. Keep this small so a pass cannot 
 concurrency = {} # Homeserver checks in flight during one pass.
 stagger_ms = {} # Delay between starting checks in one pass, so a pass does not burst a homeserver.
 poll_interval_seconds = {} # Delay between passes.
+retry_base_seconds = {} # First delay after a check that did not honor the authority. Later failures double it.
+retry_cap_hours = {} # Upper bound, in hours, on that delay. Unreachable and refused rows wait at most this long.
 
 [content_locks]
 max_resource_bytes = {} # Maximum bytes for one guarded resource upload. Raise for larger files; lower to cap memory/storage exposure.
@@ -290,6 +292,8 @@ max_total_resource_bytes = {} # Maximum combined bytes across resources in one c
         config.authority_revalidation.concurrency,
         config.authority_revalidation.stagger_ms,
         config.authority_revalidation.poll_interval_seconds,
+        config.authority_revalidation.retry_base_seconds,
+        config.authority_revalidation.retry_cap_hours,
         config.content_locks.max_resource_bytes,
         config.content_locks.max_resources,
         config.content_locks.max_total_resource_bytes

@@ -52,6 +52,7 @@ pub trait CreatorAuthorityStore: Send + Sync {
 
     /// Records the outcome of a real revalidation. `Honored` sets `last_revalidated_at` and
     /// clears `refused_at`; `Refused` sets `refused_at`. A missing record is left missing.
+    /// An honored check also clears any recheck schedule so the freshness window starts again.
     async fn record_creator_authority_check(
         &self,
         creator: &CreatorPubky,
@@ -59,22 +60,54 @@ pub trait CreatorAuthorityStore: Send + Sync {
         checked_at: time::OffsetDateTime,
     ) -> Result<(), ApplicationError>;
 
-    /// Creators whose last real check is strictly before `checked_before`, oldest first.
+    /// Creators due for a background recheck, oldest schedule first.
     ///
-    /// The last check is the later of `last_revalidated_at` and `refused_at`. A row with
-    /// neither has never been checked and is due. `limit` is the maximum number of creators
-    /// returned, so one pass cannot walk the whole table.
-    async fn list_creator_authorities_checked_before(
+    /// A row with `next_check_at` set is due when that time is at or before `now`.
+    /// A row with no schedule is due when it has never been checked, or its last
+    /// honored or refused check is strictly before `stale_before`. `limit` caps the batch.
+    async fn list_creator_authorities_due_for_recheck(
         &self,
-        checked_before: time::OffsetDateTime,
+        now: time::OffsetDateTime,
+        stale_before: time::OffsetDateTime,
         limit: u32,
-    ) -> Result<Vec<CreatorPubky>, ApplicationError>;
+    ) -> Result<Vec<DueCreatorAuthority>, ApplicationError>;
+
+    /// Records when this row may be checked again. Failures increment `failure_count`
+    /// and push `next_check_at` out so one unreachable homeserver cannot fill every batch.
+    async fn schedule_creator_authority_recheck(
+        &self,
+        creator: &CreatorPubky,
+        next_check_at: time::OffsetDateTime,
+        failure_count: u32,
+    ) -> Result<(), ApplicationError> {
+        let _ = (creator, next_check_at, failure_count);
+        Ok(())
+    }
+
+    /// Takes the database-wide recheck lease. `Ok(false)` means another replica holds it.
+    async fn try_acquire_revalidation_lease(&self) -> Result<bool, ApplicationError> {
+        Ok(true)
+    }
+
+    /// Releases the lease acquired by this store. A store that does not hold it succeeds.
+    async fn release_revalidation_lease(&self) -> Result<(), ApplicationError> {
+        Ok(())
+    }
 
     /// Ensures the creator authority record is absent.
     async fn delete_creator_authority(
         &self,
         creator: &CreatorPubky,
     ) -> Result<(), ApplicationError>;
+}
+
+/// One stored authority the background sweep may contact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DueCreatorAuthority {
+    /// Creator to revalidate.
+    pub creator: CreatorPubky,
+    /// Consecutive checks that did not honor the authority, before this attempt.
+    pub failure_count: u32,
 }
 
 /// Runtime boundary for checking creator-granted homeserver authority.

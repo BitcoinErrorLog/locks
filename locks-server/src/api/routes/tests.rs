@@ -2613,6 +2613,10 @@ async fn public_creator_authority_status_is_limited_per_railway_client_not_the_p
         .await
         .unwrap();
     assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        limited.headers().get(header::CACHE_CONTROL).unwrap(),
+        "no-store"
+    );
     let retry_after = limited
         .headers()
         .get(header::RETRY_AFTER)
@@ -2646,6 +2650,74 @@ async fn public_creator_authority_status_is_limited_per_railway_client_not_the_p
             .get(header::RETRY_AFTER)
             .is_some()
     );
+}
+
+#[tokio::test]
+async fn public_creator_authority_status_default_limit_keys_the_peer_not_client_headers() {
+    let mut config = test_config(RuntimeEnvironment::Development, true);
+    assert_eq!(config.rate_limits.trusted_proxy_hops, 0);
+    config.rate_limits.public_authority_status.max_requests = 1;
+    config.rate_limits.public_authority_status.window_seconds = 60;
+    let state = AppState::new_empty_in_memory(config);
+    seed_creator_authority(&state).await;
+    let app = router(state);
+    let uri =
+        "/creators/pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/authority-status";
+    let peer = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+
+    let first = app
+        .clone()
+        .oneshot(peer_status_request(
+            uri,
+            peer,
+            "203.0.113.10, 198.51.100.7",
+            "203.0.113.10",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+
+    let spoofed_headers = app
+        .clone()
+        .oneshot(peer_status_request(
+            uri,
+            peer,
+            "192.0.2.9, 198.51.100.8",
+            "203.0.113.99",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(spoofed_headers.status(), StatusCode::TOO_MANY_REQUESTS);
+
+    let other_peer = app
+        .oneshot(peer_status_request(
+            uri,
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+            "203.0.113.99",
+            "203.0.113.99",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(other_peer.status(), StatusCode::OK);
+}
+
+fn peer_status_request(
+    uri: &str,
+    peer: IpAddr,
+    forwarded_for: &str,
+    real_ip: &str,
+) -> Request<Body> {
+    let mut request = Request::builder()
+        .method("GET")
+        .uri(uri)
+        .header("x-forwarded-for", forwarded_for)
+        .header("x-real-ip", real_ip)
+        .body(Body::empty())
+        .unwrap();
+    request
+        .extensions_mut()
+        .insert(ConnectInfo(SocketAddr::new(peer, 443)));
+    request
 }
 
 fn forwarded_status_request(uri: &str, forwarded_for: &str) -> Request<Body> {

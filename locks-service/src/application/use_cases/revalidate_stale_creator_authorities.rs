@@ -6,6 +6,7 @@ use tokio::task::JoinSet;
 use crate::application::errors::ApplicationError;
 use crate::application::ports::{
     Clock, CreatorAuthorityManager, CreatorAuthorityStatus, CreatorAuthorityStore,
+    DueCreatorAuthority,
 };
 
 /// How one background pass chooses and spaces homeserver revalidation.
@@ -19,6 +20,10 @@ pub struct AuthorityRevalidationPolicy {
     pub concurrency: usize,
     /// Minimum delay between starting two checks in the same pass.
     pub stagger: Duration,
+    /// First delay after a check that did not honor the authority. Later failures double it.
+    pub retry_base: time::Duration,
+    /// Upper bound on that delay.
+    pub retry_cap: time::Duration,
 }
 
 /// What one pass did. Refusals and honors are whatever the manager recorded.
@@ -32,6 +37,8 @@ pub struct AuthorityRevalidationReport {
     pub refused: usize,
     /// The check did not produce a homeserver answer, so the stored validity was left as it was.
     pub left_unchanged: usize,
+    /// Another replica already holds the recheck lease, so this pass contacted nobody.
+    pub lease_held_elsewhere: bool,
 }
 
 /// Re-runs the real authority check for a small batch of stale rows.
@@ -46,9 +53,10 @@ pub async fn revalidate_stale_creator_authorities(
     clock: &dyn Clock,
     policy: AuthorityRevalidationPolicy,
 ) -> Result<AuthorityRevalidationReport, ApplicationError> {
-    let cutoff = clock.now() - policy.stale_after;
+    let now = clock.now();
+    let stale_before = now.checked_sub(policy.stale_after).unwrap_or(now);
     let due = store
-        .list_creator_authorities_checked_before(cutoff, policy.batch_size)
+        .list_creator_authorities_due_for_recheck(now, stale_before, policy.batch_size)
         .await?;
     let concurrency = policy.concurrency.max(1);
     let mut report = AuthorityRevalidationReport {
@@ -56,40 +64,133 @@ pub async fn revalidate_stale_creator_authorities(
         ..AuthorityRevalidationReport::default()
     };
     let mut in_flight = JoinSet::new();
-    for (index, creator) in due.into_iter().enumerate() {
+    for (index, candidate) in due.into_iter().enumerate() {
         if index > 0 && !policy.stagger.is_zero() {
             tokio::time::sleep(policy.stagger).await;
         }
         while in_flight.len() >= concurrency {
-            record_join(&mut report, in_flight.join_next().await);
+            finish_check(
+                store,
+                clock,
+                policy,
+                &mut report,
+                in_flight.join_next().await,
+            )
+            .await?;
         }
         let manager = Arc::clone(&manager);
-        in_flight.spawn(async move { manager.revalidate_creator_authority(&creator).await });
+        in_flight.spawn(async move {
+            let result = manager
+                .revalidate_creator_authority(&candidate.creator)
+                .await;
+            (candidate, result)
+        });
     }
     while let Some(joined) = in_flight.join_next().await {
-        record_join(&mut report, Some(joined));
+        finish_check(store, clock, policy, &mut report, Some(joined)).await?;
     }
     Ok(report)
 }
 
-fn record_join(
-    report: &mut AuthorityRevalidationReport,
-    joined: Option<
-        Result<Result<CreatorAuthorityStatus, ApplicationError>, tokio::task::JoinError>,
-    >,
-) {
-    match joined {
-        Some(Ok(Ok(_))) => report.honored += 1,
-        Some(Ok(Err(ApplicationError::CreatorAuthorityRefused))) => report.refused += 1,
-        Some(Ok(Err(_))) | Some(Err(_)) => report.left_unchanged += 1,
-        None => {}
+/// One pass that contacts homeservers only while this process holds the recheck lease.
+pub async fn revalidate_stale_creator_authorities_once(
+    store: &dyn CreatorAuthorityStore,
+    manager: Arc<dyn CreatorAuthorityManager>,
+    clock: &dyn Clock,
+    policy: AuthorityRevalidationPolicy,
+) -> Result<AuthorityRevalidationReport, ApplicationError> {
+    if !store.try_acquire_revalidation_lease().await? {
+        return Ok(AuthorityRevalidationReport {
+            lease_held_elsewhere: true,
+            ..AuthorityRevalidationReport::default()
+        });
     }
+    let result = revalidate_stale_creator_authorities(store, manager, clock, policy).await;
+    let released = store.release_revalidation_lease().await;
+    match (result, released) {
+        (Ok(report), Ok(())) => Ok(report),
+        (Err(error), _) => Err(error),
+        (_, Err(error)) => Err(error),
+    }
+}
+
+/// Delay before the next attempt after `failure_count` checks that did not honor the authority.
+///
+/// `failure_count` is 1 for the first failure. Each further failure doubles the delay until `cap`.
+pub fn recheck_backoff(
+    failure_count: u32,
+    base: time::Duration,
+    cap: time::Duration,
+) -> time::Duration {
+    let exponent = failure_count.saturating_sub(1).min(20);
+    let factor = 1i64 << exponent;
+    let base_seconds = base.whole_seconds().max(0);
+    let cap_seconds = cap.whole_seconds().max(0);
+    let seconds = base_seconds.saturating_mul(factor).min(cap_seconds);
+    time::Duration::seconds(seconds)
+}
+
+type JoinedCheck = Result<
+    (
+        DueCreatorAuthority,
+        Result<CreatorAuthorityStatus, ApplicationError>,
+    ),
+    tokio::task::JoinError,
+>;
+
+async fn finish_check(
+    store: &dyn CreatorAuthorityStore,
+    clock: &dyn Clock,
+    policy: AuthorityRevalidationPolicy,
+    report: &mut AuthorityRevalidationReport,
+    joined: Option<JoinedCheck>,
+) -> Result<(), ApplicationError> {
+    let Some(joined) = joined else {
+        return Ok(());
+    };
+    let (candidate, result) = match joined {
+        Ok(finished) => finished,
+        Err(_) => {
+            report.left_unchanged += 1;
+            return Ok(());
+        }
+    };
+    let (failure_count, delay) = match &result {
+        Ok(_) => {
+            report.honored += 1;
+            (0, policy.stale_after)
+        }
+        Err(ApplicationError::CreatorAuthorityRefused) => {
+            report.refused += 1;
+            let failure_count = candidate.failure_count.saturating_add(1);
+            (
+                failure_count,
+                recheck_backoff(failure_count, policy.retry_base, policy.retry_cap),
+            )
+        }
+        Err(_) => {
+            report.left_unchanged += 1;
+            let failure_count = candidate.failure_count.saturating_add(1);
+            (
+                failure_count,
+                recheck_backoff(failure_count, policy.retry_base, policy.retry_cap),
+            )
+        }
+    };
+    let next_check_at = clock
+        .now()
+        .checked_add(delay)
+        .unwrap_or_else(|| clock.now());
+    store
+        .schedule_creator_authority_recheck(&candidate.creator, next_check_at, failure_count)
+        .await
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::str::FromStr;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
@@ -97,13 +198,18 @@ mod tests {
     use time::OffsetDateTime;
     use tokio::sync::Notify;
 
-    use super::{AuthorityRevalidationPolicy, revalidate_stale_creator_authorities};
+    use super::{
+        AuthorityRevalidationPolicy, recheck_backoff, revalidate_stale_creator_authorities,
+        revalidate_stale_creator_authorities_once,
+    };
     use crate::application::errors::ApplicationError;
     use crate::application::models::{
         CreatorAuthorityAuthKind, CreatorAuthorityCheckOutcome, CreatorAuthorityRecord,
         CreatorAuthoritySecret, CreatorAuthorityValidity,
     };
-    use crate::application::ports::{Clock, CreatorAuthorityManager, CreatorAuthorityStore};
+    use crate::application::ports::{
+        Clock, CreatorAuthorityManager, CreatorAuthorityStore, DueCreatorAuthority,
+    };
     use crate::application::use_cases::get_creator_authority_status::get_public_creator_authority_status;
     use crate::infrastructure::pubky::{
         LegacyCookieCreatorAuthorityManager, LegacyCookieSessionRevalidator,
@@ -297,12 +403,185 @@ mod tests {
         assert!(started.elapsed() >= std::time::Duration::from_millis(50));
     }
 
+    #[tokio::test]
+    async fn an_unreachable_authority_is_not_selected_again_on_the_next_pass() {
+        let memory = Arc::new(MemoryStore::new());
+        for pubky in [
+            "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy",
+            "pubkyorhzqdiexwmi6iidktucgud63ufa5nwtsuzdxe176a8izd6jsqky",
+            "pubky3kj4afafdba8diu5oxd96dz6orrqt5nfgbmi473go6ju8s64z36y",
+        ] {
+            memory.insert(authority(&creator(pubky), None, None));
+        }
+        let revalidator =
+            ScriptedRevalidator::error(ApplicationError::CreatorAuthorityCheckUnavailable);
+        let pass_policy = policy(1, 1, 0);
+
+        let first = revalidate_stale_creator_authorities(
+            &StoreHandle(Arc::clone(&memory)),
+            manager(Arc::clone(&memory), revalidator.clone()),
+            &NowClock,
+            pass_policy,
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.selected, 1);
+        assert_eq!(first.left_unchanged, 1);
+        assert_eq!(revalidator.seen(), 1);
+
+        let second = revalidate_stale_creator_authorities(
+            &StoreHandle(Arc::clone(&memory)),
+            manager(Arc::clone(&memory), revalidator.clone()),
+            &NowClock,
+            pass_policy,
+        )
+        .await
+        .unwrap();
+        assert_eq!(second.selected, 1);
+        assert_eq!(revalidator.seen(), 2);
+        {
+            let schedules = memory.schedules.lock().unwrap();
+            assert_eq!(schedules.len(), 2);
+            assert!(schedules.values().all(|(_, failures)| *failures == 1));
+        }
+
+        let third = revalidate_stale_creator_authorities(
+            &StoreHandle(Arc::clone(&memory)),
+            manager(Arc::clone(&memory), revalidator.clone()),
+            &NowClock,
+            pass_policy,
+        )
+        .await
+        .unwrap();
+        assert_eq!(third.selected, 1);
+        assert_eq!(revalidator.seen(), 3);
+
+        let fourth = revalidate_stale_creator_authorities(
+            &StoreHandle(Arc::clone(&memory)),
+            manager(Arc::clone(&memory), revalidator.clone()),
+            &NowClock,
+            pass_policy,
+        )
+        .await
+        .unwrap();
+        assert_eq!(fourth.selected, 0);
+        assert_eq!(revalidator.seen(), 3);
+        let schedules = memory.schedules.lock().unwrap();
+        assert_eq!(schedules.len(), 3);
+        assert!(schedules.values().all(|(_, failures)| *failures == 1));
+    }
+
+    #[tokio::test]
+    async fn a_refused_authority_backs_off_and_the_delay_doubles() {
+        let memory = Arc::new(MemoryStore::new());
+        let creator = creator("pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy");
+        memory.insert(authority(&creator, Some(hours_ago(7)), None));
+        let revalidator = ScriptedRevalidator::refused();
+        let pass_policy = policy(4, 1, 0);
+
+        revalidate_stale_creator_authorities(
+            &StoreHandle(Arc::clone(&memory)),
+            manager(Arc::clone(&memory), revalidator.clone()),
+            &NowClock,
+            pass_policy,
+        )
+        .await
+        .unwrap();
+        let (first_at, first_failures) = memory.schedule_of(&creator).unwrap();
+        assert_eq!(first_failures, 1);
+        assert!(first_at >= OffsetDateTime::now_utc() + time::Duration::minutes(50));
+
+        memory
+            .schedules
+            .lock()
+            .unwrap()
+            .insert(creator.clone(), (hours_ago(1), first_failures));
+        revalidate_stale_creator_authorities(
+            &StoreHandle(Arc::clone(&memory)),
+            manager(Arc::clone(&memory), revalidator),
+            &NowClock,
+            pass_policy,
+        )
+        .await
+        .unwrap();
+        let (second_at, second_failures) = memory.schedule_of(&creator).unwrap();
+        assert_eq!(second_failures, 2);
+        assert!(
+            second_at
+                >= OffsetDateTime::now_utc() + time::Duration::hours(2)
+                    - time::Duration::minutes(5)
+        );
+        assert!(second_at - first_at > time::Duration::minutes(50));
+    }
+
+    #[tokio::test]
+    async fn a_second_pass_waits_while_the_recheck_lease_is_held() {
+        let memory = Arc::new(MemoryStore::new());
+        for pubky in [
+            "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy",
+            "pubkyorhzqdiexwmi6iidktucgud63ufa5nwtsuzdxe176a8izd6jsqky",
+        ] {
+            memory.insert(authority(&creator(pubky), None, None));
+        }
+        let revalidator = GateRevalidator::new();
+        let store = StoreHandle(Arc::clone(&memory));
+        let pass_manager = manager(Arc::clone(&memory), revalidator.clone());
+        let pass = tokio::spawn(async move {
+            revalidate_stale_creator_authorities_once(
+                &store,
+                pass_manager,
+                &NowClock,
+                policy(4, 1, 0),
+            )
+            .await
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            revalidator.entered.notified(),
+        )
+        .await
+        .expect("first check starts");
+
+        let blocked = revalidate_stale_creator_authorities_once(
+            &StoreHandle(Arc::clone(&memory)),
+            manager(Arc::clone(&memory), revalidator.clone()),
+            &NowClock,
+            policy(4, 1, 0),
+        )
+        .await
+        .unwrap();
+        assert!(blocked.lease_held_elsewhere);
+        assert_eq!(blocked.selected, 0);
+        assert_eq!(revalidator.started.load(Ordering::SeqCst), 1);
+
+        revalidator.release.notify_one();
+        let report = tokio::time::timeout(std::time::Duration::from_secs(2), pass)
+            .await
+            .expect("lease holder finishes")
+            .unwrap()
+            .unwrap();
+        assert!(!report.lease_held_elsewhere);
+        assert_eq!(report.refused, 2);
+    }
+
+    #[test]
+    fn recheck_backoff_doubles_until_the_cap() {
+        let base = time::Duration::hours(1);
+        let cap = time::Duration::hours(24);
+        assert_eq!(recheck_backoff(1, base, cap), time::Duration::hours(1));
+        assert_eq!(recheck_backoff(2, base, cap), time::Duration::hours(2));
+        assert_eq!(recheck_backoff(3, base, cap), time::Duration::hours(4));
+        assert_eq!(recheck_backoff(20, base, cap), cap);
+    }
+
     fn policy(batch_size: u32, concurrency: usize, stagger_ms: u64) -> AuthorityRevalidationPolicy {
         AuthorityRevalidationPolicy {
             stale_after: time::Duration::hours(6),
             batch_size,
             concurrency,
             stagger: std::time::Duration::from_millis(stagger_ms),
+            retry_base: time::Duration::hours(1),
+            retry_cap: time::Duration::hours(24),
         }
     }
 
@@ -353,6 +632,8 @@ mod tests {
     #[derive(Default)]
     struct MemoryStore {
         records: Mutex<Vec<(CreatorAuthorityRecord, Option<OffsetDateTime>)>>,
+        schedules: Mutex<HashMap<CreatorPubky, (OffsetDateTime, u32)>>,
+        lease: AtomicBool,
     }
 
     impl MemoryStore {
@@ -373,6 +654,10 @@ mod tests {
                     (record.creator == *creator)
                         .then(|| CreatorAuthorityValidity::from_record(record, *refused_at))
                 })
+        }
+
+        fn schedule_of(&self, creator: &CreatorPubky) -> Option<(OffsetDateTime, u32)> {
+            self.schedules.lock().unwrap().get(creator).copied()
         }
 
         fn unchecked(&self) -> usize {
@@ -472,15 +757,21 @@ mod tests {
             Ok(())
         }
 
-        async fn list_creator_authorities_checked_before(
+        async fn list_creator_authorities_due_for_recheck(
             &self,
-            checked_before: OffsetDateTime,
+            now: OffsetDateTime,
+            stale_before: OffsetDateTime,
             limit: u32,
-        ) -> Result<Vec<CreatorPubky>, ApplicationError> {
+        ) -> Result<Vec<DueCreatorAuthority>, ApplicationError> {
             if limit == 0 {
                 return Ok(Vec::new());
             }
-            let mut due: Vec<(Option<OffsetDateTime>, CreatorPubky)> = self
+            let schedules = self.0.schedules.lock().unwrap();
+            let mut due: Vec<(
+                Option<OffsetDateTime>,
+                Option<OffsetDateTime>,
+                DueCreatorAuthority,
+            )> = self
                 .0
                 .records
                 .lock()
@@ -488,21 +779,62 @@ mod tests {
                 .iter()
                 .filter_map(|(record, refused_at)| {
                     let validity = CreatorAuthorityValidity::from_record(record, *refused_at);
+                    let scheduled = schedules.get(&record.creator).copied();
+                    let next_check_at = scheduled.map(|(at, _)| at);
+                    let failure_count = scheduled.map(|(_, count)| count).unwrap_or(0);
                     validity
-                        .due_before(checked_before)
-                        .then(|| (validity.last_checked_at(), record.creator.clone()))
+                        .recheck_due(next_check_at, now, stale_before)
+                        .then(|| {
+                            (
+                                next_check_at,
+                                validity.last_checked_at(),
+                                DueCreatorAuthority {
+                                    creator: record.creator.clone(),
+                                    failure_count,
+                                },
+                            )
+                        })
                 })
                 .collect();
+            drop(schedules);
             due.sort_by(|left, right| {
                 left.0
                     .cmp(&right.0)
-                    .then_with(|| left.1.to_string().cmp(&right.1.to_string()))
+                    .then_with(|| left.1.cmp(&right.1))
+                    .then_with(|| left.2.creator.to_string().cmp(&right.2.creator.to_string()))
             });
             Ok(due
                 .into_iter()
                 .take(usize::try_from(limit).unwrap_or(usize::MAX))
-                .map(|(_, creator)| creator)
+                .map(|(_, _, candidate)| candidate)
                 .collect())
+        }
+
+        async fn schedule_creator_authority_recheck(
+            &self,
+            creator: &CreatorPubky,
+            next_check_at: OffsetDateTime,
+            failure_count: u32,
+        ) -> Result<(), ApplicationError> {
+            self.0
+                .schedules
+                .lock()
+                .unwrap()
+                .insert(creator.clone(), (next_check_at, failure_count));
+            Ok(())
+        }
+
+        async fn try_acquire_revalidation_lease(&self) -> Result<bool, ApplicationError> {
+            Ok(self
+                .0
+                .lease
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok())
+        }
+
+        async fn release_revalidation_lease(&self) -> Result<(), ApplicationError> {
+            self.0.lease.store(false, Ordering::Release);
+            Ok(())
         }
 
         async fn delete_creator_authority(

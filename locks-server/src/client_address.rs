@@ -1,28 +1,25 @@
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv6Addr};
 
 use axum::http::HeaderMap;
 
-/// Railway's edge appends its own address as the rightmost `X-Forwarded-For` hop.
-/// The client the edge observed is the hop before that, so a Railway deployment
-/// trusts two hops counted from the right. One hop would key Railway's proxy and
-/// put every client in the same bucket.
+/// Hop count measured on paykit-server's Railway edge on 2026-09-22: `X-Forwarded-For`
+/// was `client, railway-hop`, and a spoofed leading value stayed in the real client's bucket
+/// when two hops were trusted. Locks does not apply that count automatically. There is no
+/// header capture for a locks deployment, and `X-Real-IP` was not shown to be overwrite-only,
+/// so the default key is the TCP peer.
 pub const RAILWAY_TRUSTED_PROXY_HOPS: u32 = 2;
 
 /// Client address used to key a public rate limit.
 ///
-/// * `trusted_proxy_hops == 0` ignores forwarding headers and returns `peer`.
-/// * `trusted_proxy_hops >= 1` takes the Nth `X-Forwarded-For` hop from the right,
-///   the hop a trusted proxy appended. Leading entries are client-supplied and ignored.
-/// * A missing or unparseable hop falls back to `X-Real-IP` (Railway overwrites it
-///   with the client) and then to `peer`.
-pub fn client_ip(
-    peer: IpAddr,
-    trusted_proxy_hops: u32,
-    x_forwarded_for: Option<&str>,
-    x_real_ip: Option<&str>,
-) -> IpAddr {
+/// * `trusted_proxy_hops == 0` ignores forwarding headers and returns the peer.
+///   That is the default, including when `RAILWAY_ENVIRONMENT` is set.
+/// * `trusted_proxy_hops >= 1` takes the Nth `X-Forwarded-For` hop from the right.
+///   Leading entries are ignored. A missing, short, or unparseable chain returns the peer.
+/// * `X-Real-IP` is never a key. A client can supply it when the edge does not overwrite it.
+/// * IPv6 keys are the `/64` prefix. IPv4-mapped IPv6 is the embedded IPv4 address.
+pub fn client_ip(peer: IpAddr, trusted_proxy_hops: u32, x_forwarded_for: Option<&str>) -> IpAddr {
     if trusted_proxy_hops == 0 {
-        return canonicalize_ip(peer);
+        return rate_limit_bucket(peer);
     }
     if let Some(xff) = x_forwarded_for {
         let hops: Vec<&str> = xff
@@ -33,14 +30,11 @@ pub fn client_ip(
         if hops.len() >= trusted_proxy_hops as usize {
             let index = hops.len() - trusted_proxy_hops as usize;
             if let Some(ip) = parse_forwarded_hop(hops[index]) {
-                return ip;
+                return rate_limit_bucket(ip);
             }
         }
     }
-    if let Some(real) = x_real_ip.and_then(parse_forwarded_hop) {
-        return real;
-    }
-    canonicalize_ip(peer)
+    rate_limit_bucket(peer)
 }
 
 pub fn client_ip_from_headers(
@@ -52,17 +46,34 @@ pub fn client_ip_from_headers(
         peer,
         trusted_proxy_hops,
         header_str(headers, "x-forwarded-for"),
-        header_str(headers, "x-real-ip"),
     )
 }
 
-/// `Some(configured)` is explicit, including zero. When the key is absent, a
-/// process running on Railway trusts [`RAILWAY_TRUSTED_PROXY_HOPS`].
+/// Explicit configuration wins, including zero. A missing key is zero.
+/// `railway_environment_set` does not change the result: this service has no
+/// captured proxy chain to infer a hop count from.
 pub fn resolve_trusted_proxy_hops(configured: Option<u32>, railway_environment_set: bool) -> u32 {
-    match configured {
-        Some(hops) => hops,
-        None if railway_environment_set => RAILWAY_TRUSTED_PROXY_HOPS,
-        None => 0,
+    let _ = railway_environment_set;
+    configured.unwrap_or(0)
+}
+
+/// Bucket key. IPv4 is itself. IPv6 is its `/64` network address.
+pub fn rate_limit_bucket(ip: IpAddr) -> IpAddr {
+    match canonicalize_ip(ip) {
+        IpAddr::V4(v4) => IpAddr::V4(v4),
+        IpAddr::V6(v6) => {
+            let segments = v6.segments();
+            IpAddr::V6(Ipv6Addr::new(
+                segments[0],
+                segments[1],
+                segments[2],
+                segments[3],
+                0,
+                0,
+                0,
+                0,
+            ))
+        }
     }
 }
 
@@ -109,7 +120,7 @@ fn canonicalize_ip(ip: IpAddr) -> IpAddr {
 
 #[cfg(test)]
 mod tests {
-    use std::net::{Ipv4Addr, Ipv6Addr};
+    use std::net::Ipv4Addr;
 
     use super::*;
 
@@ -120,53 +131,42 @@ mod tests {
     #[test]
     fn hops_zero_ignores_forwarding_headers() {
         assert_eq!(
-            client_ip(
-                peer(),
-                0,
-                Some("203.0.113.10, 198.51.100.7"),
-                Some("203.0.113.10")
-            ),
+            client_ip(peer(), 0, Some("203.0.113.10, 198.51.100.7")),
             peer()
         );
     }
 
     #[test]
-    fn railway_two_hops_select_the_client_not_the_appended_proxy() {
-        // Railway writes "client, railway-hop". The rightmost entry is the proxy.
+    fn an_explicit_two_hops_select_the_client_not_the_appended_proxy() {
         let xff = "203.0.113.10, 198.51.100.7";
         let client: IpAddr = "203.0.113.10".parse().unwrap();
         let railway: IpAddr = "198.51.100.7".parse().unwrap();
-        assert_eq!(client_ip(peer(), 1, Some(xff), None), railway);
-        assert_eq!(client_ip(peer(), 2, Some(xff), None), client);
+        assert_eq!(client_ip(peer(), 1, Some(xff)), railway);
+        assert_eq!(client_ip(peer(), 2, Some(xff)), client);
     }
 
     #[test]
-    fn a_spoofed_leading_hop_does_not_change_the_railway_client() {
-        let honest = client_ip(peer(), 2, Some("203.0.113.10, 198.51.100.7"), None);
-        let spoofed = client_ip(
-            peer(),
-            2,
-            Some("192.0.2.9, 203.0.113.10, 198.51.100.7"),
-            None,
-        );
+    fn a_spoofed_leading_hop_does_not_change_an_explicit_two_hop_key() {
+        let honest = client_ip(peer(), 2, Some("203.0.113.10, 198.51.100.7"));
+        let spoofed = client_ip(peer(), 2, Some("192.0.2.9, 203.0.113.10, 198.51.100.7"));
         assert_eq!(honest, spoofed);
         assert_eq!(honest, "203.0.113.10".parse::<IpAddr>().unwrap());
     }
 
     #[test]
-    fn too_few_xff_hops_fall_back_to_x_real_ip_then_the_peer() {
-        assert_eq!(
-            client_ip(peer(), 2, Some("198.51.100.7"), Some("203.0.113.10")),
-            "203.0.113.10".parse::<IpAddr>().unwrap()
-        );
-        assert_eq!(client_ip(peer(), 2, None, None), peer());
+    fn a_short_xff_uses_the_peer_and_not_x_real_ip() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "198.51.100.7".parse().unwrap());
+        headers.insert("x-real-ip", "203.0.113.10".parse().unwrap());
+        assert_eq!(client_ip_from_headers(peer(), 2, &headers), peer());
+        assert_eq!(client_ip(peer(), 2, None), peer());
     }
 
     #[test]
     fn ipv4_mapped_ipv6_is_the_embedded_address() {
         let mapped: IpAddr = "::ffff:203.0.113.10".parse().unwrap();
         assert_eq!(
-            client_ip(peer(), 2, Some("::ffff:203.0.113.10, 198.51.100.7"), None),
+            client_ip(peer(), 2, Some("::ffff:203.0.113.10, 198.51.100.7")),
             IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10))
         );
         assert_eq!(
@@ -176,22 +176,24 @@ mod tests {
     }
 
     #[test]
-    fn bracketed_ipv6_hop_parses() {
-        let v6: Ipv6Addr = "2001:db8::1".parse().unwrap();
-        assert_eq!(
-            client_ip(peer(), 1, Some("[2001:db8::1]:443"), None),
-            IpAddr::V6(v6)
-        );
+    fn ipv6_clients_in_one_prefix_share_a_bucket() {
+        let left = client_ip(peer(), 1, Some("[2001:db8:1:2::1]:443"));
+        let right = client_ip(peer(), 1, Some("2001:db8:1:2::abcd"));
+        let other = client_ip(peer(), 1, Some("2001:db8:1:3::1"));
+        let prefix: IpAddr = "2001:db8:1:2::".parse().unwrap();
+        assert_eq!(left, prefix);
+        assert_eq!(right, prefix);
+        assert_ne!(other, prefix);
     }
 
     #[test]
-    fn an_explicit_hop_count_wins_over_the_railway_default() {
+    fn railway_environment_does_not_select_a_hop_count() {
         assert_eq!(resolve_trusted_proxy_hops(Some(0), true), 0);
-        assert_eq!(resolve_trusted_proxy_hops(Some(2), false), 2);
         assert_eq!(
-            resolve_trusted_proxy_hops(None, true),
-            RAILWAY_TRUSTED_PROXY_HOPS
+            resolve_trusted_proxy_hops(Some(RAILWAY_TRUSTED_PROXY_HOPS), false),
+            2
         );
+        assert_eq!(resolve_trusted_proxy_hops(None, true), 0);
         assert_eq!(resolve_trusted_proxy_hops(None, false), 0);
     }
 }

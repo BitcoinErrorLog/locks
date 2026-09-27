@@ -142,6 +142,22 @@ impl CreatorAuthorityValidity {
             .is_none_or(|checked_at| checked_at < cutoff)
     }
 
+    /// Whether a background pass should contact this row.
+    ///
+    /// A scheduled row is due at `next_check_at`. An unscheduled row is due from
+    /// [`Self::due_before`] against `stale_before`.
+    pub fn recheck_due(
+        &self,
+        next_check_at: Option<OffsetDateTime>,
+        now: OffsetDateTime,
+        stale_before: OffsetDateTime,
+    ) -> bool {
+        match next_check_at {
+            Some(at) => at <= now,
+            None => self.due_before(stale_before),
+        }
+    }
+
     /// The one rule both authority-status routes answer with: the last real check was not
     /// refused, and any reported expiry is still in the future.
     pub fn is_usable_at(&self, now: OffsetDateTime) -> bool {

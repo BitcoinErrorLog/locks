@@ -605,11 +605,12 @@ mod tests {
             Ok(())
         }
 
-        async fn list_creator_authorities_checked_before(
+        async fn list_creator_authorities_due_for_recheck(
             &self,
-            _checked_before: OffsetDateTime,
+            _now: OffsetDateTime,
+            _stale_before: OffsetDateTime,
             _limit: u32,
-        ) -> Result<Vec<CreatorPubky>, ApplicationError> {
+        ) -> Result<Vec<crate::application::ports::DueCreatorAuthority>, ApplicationError> {
             Ok(Vec::new())
         }
 

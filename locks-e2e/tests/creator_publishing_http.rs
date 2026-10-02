@@ -817,7 +817,7 @@ impl FakePaykitServer {
         let app = Router::new()
             .route("/invoices", post(fake_invoice_handler))
             .route("/connections/status", post(fake_connection_status_handler))
-            .route("/transactions/status", post(fake_status_handler))
+            .route("/payment-requests/status", post(fake_status_handler))
             .with_state(Arc::clone(&state));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let server_url = format!("http://{}", listener.local_addr().unwrap());
@@ -896,14 +896,17 @@ async fn fake_invoice_handler(
     State(state): State<Arc<Mutex<FakePaykitState>>>,
     headers: HeaderMap,
     body: Bytes,
-) -> StatusCode {
+) -> impl axum::response::IntoResponse {
     let mut state = state.lock().await;
     state.invoice_count += 1;
     state.invoice_body = Some(serde_json::from_slice(&body).unwrap());
     state.invoice_signature = headers
         .get("X-Paykit-Signature")
         .map(|value| value.to_str().unwrap().to_owned());
-    StatusCode::NO_CONTENT
+    Json(json!({
+        "invoice_created_at": "2026-09-25T11:00:00Z",
+        "payment_deadline": "2026-09-25T12:00:00Z"
+    }))
 }
 
 async fn fake_connection_status_handler(
@@ -930,7 +933,10 @@ async fn fake_status_handler(
         .get("X-Paykit-Signature")
         .map(|value| value.to_str().unwrap().to_owned());
     Json(json!({
-        "status": "detected",
+        "request_state": "accepted",
+        "payment_state": "detected",
+        "invoice_created_at": "2026-09-25T11:00:00Z",
+        "payment_deadline": "2026-09-25T12:00:00Z",
         "confirmations": 0,
         "amount_matched": true,
     }))

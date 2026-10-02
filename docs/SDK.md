@@ -68,6 +68,8 @@ examples/js-sdk/
 
 They are application examples, not operator scripts. Use them when integrating the SDK into a browser app. They cover creator connect/publishing and viewer discovery/access flows, while keeping verifier-specific proof construction caller-owned. For `paykit-payment`, callers construct a single proof with `verifier_type = "paykit-payment"`, `payload = {}`, and top-level `reader_public_key` on the submitted proof bundle; payment details come from the creator's content lock params, not the submitted proof payload.
 
+For a focused, copyable Paykit viewer flow plus exact request/response and terminal-state handling, see [`SDK_PAYKIT_VIEWER.md`](SDK_PAYKIT_VIEWER.md) and [`examples/js-sdk/paykit-viewer-flow.js`](../examples/js-sdk/paykit-viewer-flow.js). The signed Paykit lifecycle integration adds no new SDK export; that flow composes existing public viewer calls.
+
 Run the static drift check:
 
 ```bash
@@ -402,10 +404,12 @@ const locksForContent = await Locks.forContentLock(
 ### Submit proof bundle
 
 ```ts
-import { BundleId, VerificationTaskHandleOptions } from "locks-sdk-wasm";
+import init, { BundleId, VerificationTaskHandleOptions } from "@synonymdev/locks-sdk";
 
+await init();
 const viewer = locks.viewer;
-const bundleId = BundleId.generate().toString(); // caller must store durably; bearer-like recovery handle
+const bundleId = BundleId.generate().toString();
+await persistBundleId(bundleId); // application-owned durable, secret-safe storage
 const creator = "pubky...";
 
 const lifecycle = await viewer.submitProofBundle({

@@ -14,6 +14,7 @@ examples/js-sdk/creator-complete-flow.js
 examples/js-sdk/reader.html
 examples/js-sdk/reader-app.js
 examples/js-sdk/reader-flow.js
+examples/js-sdk/paykit-viewer-flow.js
 examples/js-sdk/scripts/init-config.mjs
 examples/js-sdk/scripts/homegate-bridge.mjs
 examples/js-sdk/scripts/create-user.mjs
@@ -211,9 +212,11 @@ npm --prefix examples/js-sdk run authenticate-paykit -- --role content-creator
 Do not wrap these commands in `docker compose exec`. The host wrappers load private role
 state locally and bridge only bounded helper input into the relevant container.
 
-The Paykit Server build uses release tag `v0.1.0-rc3`, the active Locks checkout,
-Paykit Rust `v0.1.0-rc48`, and Pubky Homeserver `v0.11.0`. This release provides the setup-status
-and Noise connection-status APIs required by Locks. No sibling repository checkout is required.
+The local demo selects immutable Paykit Server release tag `0.1.0-rc7`, the active Locks
+checkout, and Pubky Homeserver `v0.11.0`. Paykit Server local-demo build uses Paykit Rust
+`v0.1.0-rc59`; Locks workspace retains Paykit Rust `v0.1.0-rc56`. Contract checks derive
+server release ref from canonical Compose build context. No sibling repository checkout
+is required for source resolution.
 
 For coordinated Paykit Server work, select an explicit absolute local worktree
 without changing the committed public default:
@@ -454,6 +457,8 @@ After success, the page displays the **Viewer content lock resource**:
 ## Reader browser flow
 
 The browser remains unauthenticated. A `paykit-payment` proof carries the public key prepared by the native helper; the browser never receives the reader secret or encrypted Paykit state.
+
+For SDK consumers who do not need this demo's helper/server orchestration, [`paykit-viewer-flow.js`](paykit-viewer-flow.js) is the concise copyable browser flow. [`docs/SDK_PAYKIT_VIEWER.md`](../../docs/SDK_PAYKIT_VIEWER.md) documents its public exports, exact request/response shapes, lifecycle terminals, independent connection-state observation, and bearer-only credential use.
 
 1. Copy the creator demo's **Viewer content lock resource** and paste it into the reader demo.
 2. Click **Load lock**. The browser SDK validates the content lock and resolves the Lock Server.

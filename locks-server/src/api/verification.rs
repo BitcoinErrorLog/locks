@@ -32,11 +32,13 @@ use crate::api::errors::{ApiError, ApiErrorCode};
 use crate::api::extractors::parse_json;
 use crate::app_state::AppState;
 use crate::paykit_http_client::{
-    PaykitClientError, PaykitConnectionStatusRequest, PaykitInvoiceRequest,
+    PaykitClientError, PaykitConnectionStatusRequest, PaykitInvoiceRefusal, PaykitInvoiceRequest,
 };
 use crate::rate_limit::{
     PaykitConnectionStateLookupRateLimitKey, VerificationSubmissionRateLimitKey,
 };
+use crate::reader_admission::{ReaderAdmissionKey, ReaderAdmissionWindow, ReaderAdmissionWindows};
+use time::OffsetDateTime;
 
 pub(super) async fn submit_proof_bundle(
     State(state): State<AppState>,
@@ -148,15 +150,75 @@ async fn maybe_prepare_paykit_submission(
             "paykit is not configured",
         )
     })?;
-    paykit
+    let admission = ReaderAdmissionKey {
+        creator: submitted.pubky_lock_resource.creator().clone(),
+        bundle_id: submitted.bundle_id.clone(),
+    };
+    let windows = state.reader_admission_windows();
+    if windows.window(&admission, state.clock().now()) == ReaderAdmissionWindow::Expired {
+        return Err(reader_admission_expired());
+    }
+    let created = paykit
         .create_invoice(&PaykitInvoiceRequest {
             bundle_id: submitted.bundle_id.to_string(),
             lock_resource: submitted.pubky_lock_resource.to_string(),
             reader: reader.to_string(),
         })
-        .await
-        .map_err(map_paykit_invoice_error)?;
+        .await;
+    match created {
+        Ok(()) => windows.close(&admission),
+        Err(PaykitClientError::InvoiceRefused(refusal)) => {
+            return Err(map_paykit_invoice_refusal(
+                refusal,
+                windows,
+                &admission,
+                state.clock().now(),
+            ));
+        }
+        Err(error) => return Err(map_paykit_invoice_error(error)),
+    }
     Ok(PreparedSubmission { existing })
+}
+
+/// Maps a typed reader refusal. `reader_not_payable` is final. Setup-pending
+/// and malformed registries may be resubmitted with the same Bundle ID only
+/// inside the fixed window the first refusal opened; neither answer carries
+/// `Retry-After`, so the viewer resubmits when the reader acts.
+fn map_paykit_invoice_refusal(
+    refusal: PaykitInvoiceRefusal,
+    windows: &ReaderAdmissionWindows,
+    admission: &ReaderAdmissionKey,
+    now: OffsetDateTime,
+) -> ApiError {
+    tracing::warn!(?refusal, "Paykit refused the invoice for the reader");
+    let retryable = match refusal {
+        PaykitInvoiceRefusal::ReaderNotPayable => {
+            windows.close(admission);
+            return ApiError::new(
+                ApiErrorCode::ReaderNotPayable,
+                "reader has no Paykit wallet able to pay requests",
+            );
+        }
+        PaykitInvoiceRefusal::ReaderSetupPending => ApiError::new(
+            ApiErrorCode::ReaderWalletSetupNeeded,
+            "reader wallet setup needed",
+        ),
+        PaykitInvoiceRefusal::ReaderRegistryMalformed => ApiError::new(
+            ApiErrorCode::ReaderRegistryMalformed,
+            "reader Paykit registry is malformed",
+        ),
+    };
+    if windows.record_refusal(admission, now) == ReaderAdmissionWindow::Expired {
+        return reader_admission_expired();
+    }
+    retryable
+}
+
+fn reader_admission_expired() -> ApiError {
+    ApiError::new(
+        ApiErrorCode::ReaderAdmissionExpired,
+        "reader wallet setup was not completed in time; start again with a new bundle",
+    )
 }
 
 fn map_paykit_invoice_error(error: PaykitClientError) -> ApiError {

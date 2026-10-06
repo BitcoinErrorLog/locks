@@ -29,6 +29,10 @@ pub enum ApiErrorCode {
     NotPaykitPayment,
     ReaderPubkyUnresolvable,
     PaykitInvoiceCreationFailed,
+    ReaderNotPayable,
+    ReaderWalletSetupNeeded,
+    ReaderRegistryMalformed,
+    ReaderAdmissionExpired,
     PaykitConnectionStateUnavailable,
     PaykitConnectionStateTimeout,
     RateLimited,
@@ -62,6 +66,10 @@ impl ApiErrorCode {
             Self::NotPaykitPayment => "not_paykit_payment",
             Self::ReaderPubkyUnresolvable => "reader_pubky_unresolvable",
             Self::PaykitInvoiceCreationFailed => "paykit_invoice_creation_failed",
+            Self::ReaderNotPayable => "reader_not_payable",
+            Self::ReaderWalletSetupNeeded => "reader_wallet_setup_needed",
+            Self::ReaderRegistryMalformed => "reader_registry_malformed",
+            Self::ReaderAdmissionExpired => "reader_admission_expired",
             Self::PaykitConnectionStateUnavailable => "paykit_connection_state_unavailable",
             Self::PaykitConnectionStateTimeout => "paykit_connection_state_timeout",
             Self::RateLimited => "rate_limited",
@@ -90,14 +98,17 @@ impl ApiErrorCode {
                 StatusCode::UNAUTHORIZED
             }
             Self::FrontendSessionStateMismatch => StatusCode::BAD_REQUEST,
-            Self::TaskStateConflict => StatusCode::CONFLICT,
+            Self::TaskStateConflict | Self::ReaderNotPayable | Self::ReaderAdmissionExpired => {
+                StatusCode::CONFLICT
+            }
+            Self::ReaderWalletSetupNeeded => StatusCode::SERVICE_UNAVAILABLE,
             Self::UnsupportedVerifierType
             | Self::PaykitNotConfigured
             | Self::NotPaykitPayment
             | Self::ReaderPubkyUnresolvable => StatusCode::UNPROCESSABLE_ENTITY,
-            Self::PaykitInvoiceCreationFailed | Self::PaykitConnectionStateUnavailable => {
-                StatusCode::BAD_GATEWAY
-            }
+            Self::PaykitInvoiceCreationFailed
+            | Self::ReaderRegistryMalformed
+            | Self::PaykitConnectionStateUnavailable => StatusCode::BAD_GATEWAY,
             Self::PaykitConnectionStateTimeout => StatusCode::GATEWAY_TIMEOUT,
             Self::RateLimited => StatusCode::TOO_MANY_REQUESTS,
             Self::PayloadTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
@@ -451,6 +462,26 @@ mod tests {
                 ApiErrorCode::PaykitInvoiceCreationFailed,
                 StatusCode::BAD_GATEWAY,
                 "paykit_invoice_creation_failed",
+            ),
+            (
+                ApiErrorCode::ReaderNotPayable,
+                StatusCode::CONFLICT,
+                "reader_not_payable",
+            ),
+            (
+                ApiErrorCode::ReaderWalletSetupNeeded,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "reader_wallet_setup_needed",
+            ),
+            (
+                ApiErrorCode::ReaderRegistryMalformed,
+                StatusCode::BAD_GATEWAY,
+                "reader_registry_malformed",
+            ),
+            (
+                ApiErrorCode::ReaderAdmissionExpired,
+                StatusCode::CONFLICT,
+                "reader_admission_expired",
             ),
             (
                 ApiErrorCode::PaykitConnectionStateUnavailable,

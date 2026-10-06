@@ -488,6 +488,158 @@ async fn post_proof_bundles_replay_returns_lifecycle_without_replaying_paykit_in
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 
+const READER_NOT_PAYABLE: (StatusCode, &str) = (
+    StatusCode::CONFLICT,
+    r#"{"error":{"code":"reader_not_payable","message":"reader has no Paykit app able to pay requests"}}"#,
+);
+const READER_SETUP_PENDING: (StatusCode, &str) = (
+    StatusCode::SERVICE_UNAVAILABLE,
+    r#"{"error":{"code":"reader_setup_pending","message":"reader wallet setup needed"}}"#,
+);
+const READER_REGISTRY_MALFORMED: (StatusCode, &str) = (
+    StatusCode::BAD_GATEWAY,
+    r#"{"error":{"code":"reader_registry_malformed","message":"reader registry is malformed"}}"#,
+);
+
+struct ReaderAdmissionHarness {
+    app: Router,
+    state: AppState,
+    clock: Arc<SteppingClock>,
+    calls: Arc<AtomicUsize>,
+    bundle: SubmittedProofBundle,
+}
+
+impl ReaderAdmissionHarness {
+    async fn new(refusals: Vec<(StatusCode, &'static str)>) -> Self {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let paykit_url = spawn_scripted_paykit_invoice(refusals, Arc::clone(&calls)).await;
+        let paykit = Arc::new(
+            PaykitHttpClient::new_for_test(&paykit_url, Keypair::from_secret(&[9_u8; 32])).unwrap(),
+        );
+        let (content_lock, bundle) = paykit_content_lock_and_bundle();
+        let clock = Arc::new(SteppingClock::new(datetime!(2026-10-06 12:00:00 UTC)));
+        let state = test_state()
+            .with_clock(clock.clone())
+            .with_reader_pubky_resolver(Arc::new(AlwaysResolvesReader))
+            .with_paykit_http_client(Some(paykit));
+        seed_content_lock(&state, content_lock).await;
+        Self {
+            app: router(state.clone()),
+            state,
+            clock,
+            calls,
+            bundle,
+        }
+    }
+
+    async fn submit(&self) -> axum::response::Response {
+        self.app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/proof-bundles",
+                json!({ "submitted_proof_bundle": self.bundle.clone() }),
+            ))
+            .await
+            .unwrap()
+    }
+
+    fn paykit_calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+
+    async fn task_exists(&self) -> bool {
+        self.state
+            .verification_tasks()
+            .get_verification_task_by_handle(&creator(), &self.bundle.bundle_id)
+            .await
+            .unwrap()
+            .is_some()
+    }
+}
+
+async fn assert_reader_refusal(response: axum::response::Response, status: StatusCode, code: &str) {
+    assert_eq!(response.status(), status);
+    assert!(
+        response.headers().get(header::RETRY_AFTER).is_none(),
+        "{code} carries no Retry-After"
+    );
+    assert_eq!(response_json(response).await["error"]["code"], code);
+}
+
+#[tokio::test]
+async fn post_proof_bundles_reader_not_payable_is_terminal_not_a_task_conflict() {
+    let harness = ReaderAdmissionHarness::new(vec![READER_NOT_PAYABLE]).await;
+
+    assert_reader_refusal(
+        harness.submit().await,
+        StatusCode::CONFLICT,
+        "reader_not_payable",
+    )
+    .await;
+    assert_eq!(harness.paykit_calls(), 1);
+    assert!(!harness.task_exists().await);
+}
+
+#[tokio::test]
+async fn post_proof_bundles_setup_pending_resubmits_only_inside_the_fixed_window() {
+    let harness = ReaderAdmissionHarness::new(vec![
+        READER_SETUP_PENDING,
+        READER_SETUP_PENDING,
+        READER_SETUP_PENDING,
+    ])
+    .await;
+
+    assert_reader_refusal(
+        harness.submit().await,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "reader_wallet_setup_needed",
+    )
+    .await;
+    assert_eq!(harness.paykit_calls(), 1);
+
+    // A later refusal inside the window does not move its deadline.
+    harness.clock.advance(time::Duration::minutes(9));
+    assert_reader_refusal(
+        harness.submit().await,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "reader_wallet_setup_needed",
+    )
+    .await;
+    assert_eq!(harness.paykit_calls(), 2);
+
+    // Ten minutes after the first refusal the bundle is refused for good,
+    // without another Paykit call.
+    harness.clock.advance(time::Duration::minutes(1));
+    assert_reader_refusal(
+        harness.submit().await,
+        StatusCode::CONFLICT,
+        "reader_admission_expired",
+    )
+    .await;
+    assert_eq!(harness.paykit_calls(), 2);
+    assert!(!harness.task_exists().await);
+}
+
+#[tokio::test]
+async fn post_proof_bundles_malformed_registry_is_retryable_until_setup_completes() {
+    let harness = ReaderAdmissionHarness::new(vec![READER_REGISTRY_MALFORMED]).await;
+
+    assert_reader_refusal(
+        harness.submit().await,
+        StatusCode::BAD_GATEWAY,
+        "reader_registry_malformed",
+    )
+    .await;
+    assert!(!harness.task_exists().await);
+
+    harness.clock.advance(time::Duration::minutes(5));
+    let admitted = harness.submit().await;
+    assert_eq!(admitted.status(), StatusCode::OK);
+    assert_eq!(harness.paykit_calls(), 2);
+    assert!(harness.task_exists().await);
+}
+
 #[tokio::test]
 async fn paykit_connection_state_lookup_returns_server_local_recovery_state() {
     let paykit_url = spawn_paykit_connection_status_body(r#"{"state":"recovery_required"}"#).await;
@@ -3526,6 +3678,38 @@ async fn spawn_counting_paykit_invoice(calls: Arc<AtomicUsize>) -> String {
     format!("http://{address}")
 }
 
+/// Answers `/invoices` with each scripted refusal in turn, then with success.
+async fn spawn_scripted_paykit_invoice(
+    refusals: Vec<(StatusCode, &'static str)>,
+    calls: Arc<AtomicUsize>,
+) -> String {
+    type Script = Arc<Mutex<std::collections::VecDeque<(StatusCode, &'static str)>>>;
+    async fn invoice(
+        State((script, calls)): State<(Script, Arc<AtomicUsize>)>,
+    ) -> axum::response::Response {
+        use axum::response::IntoResponse;
+        calls.fetch_add(1, Ordering::SeqCst);
+        let next = script.lock().unwrap().pop_front();
+        match next {
+            Some((status, body)) => {
+                (status, [(header::CONTENT_TYPE, "application/json")], body).into_response()
+            }
+            None => invoice_created_response().into_response(),
+        }
+    }
+
+    let script: Script = Arc::new(Mutex::new(refusals.into()));
+    let app = Router::new()
+        .route("/invoices", post(invoice))
+        .with_state((script, calls));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{address}")
+}
+
 async fn spawn_paykit_connection_status_body(body: &'static str) -> String {
     async fn invoice() -> impl axum::response::IntoResponse {
         invoice_created_response()
@@ -3932,6 +4116,24 @@ struct FixedClock(time::OffsetDateTime);
 impl Clock for FixedClock {
     fn now(&self) -> time::OffsetDateTime {
         self.0
+    }
+}
+
+struct SteppingClock(Mutex<time::OffsetDateTime>);
+
+impl SteppingClock {
+    fn new(now: time::OffsetDateTime) -> Self {
+        Self(Mutex::new(now))
+    }
+
+    fn advance(&self, by: time::Duration) {
+        *self.0.lock().unwrap() += by;
+    }
+}
+
+impl Clock for SteppingClock {
+    fn now(&self) -> time::OffsetDateTime {
+        *self.0.lock().unwrap()
     }
 }
 

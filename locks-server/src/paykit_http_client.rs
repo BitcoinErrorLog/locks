@@ -53,6 +53,8 @@ pub enum PaykitClientError {
         operation: &'static str,
         status: StatusCode,
     },
+    #[error("Paykit refused the invoice for the reader: {0:?}")]
+    InvoiceRefused(PaykitInvoiceRefusal),
     #[error("Paykit connection-status response was invalid: {0}")]
     InvalidConnectionStatusResponse(reqwest::Error),
     #[error("Paykit connection-status response JSON was invalid: {0}")]
@@ -92,9 +94,50 @@ impl PaykitClientError {
             | Self::InvalidPaymentStatusJson(_)
             | Self::StatusBodyTooLarge
             | Self::InvalidStatusTimestamps
-            | Self::NonSuccess { .. } => false,
+            | Self::NonSuccess { .. }
+            | Self::InvoiceRefused(_) => false,
         }
     }
+}
+
+/// Typed reader-admission refusals of `POST /invoices`. Only these exact
+/// status and code pairs are recognised; any other non-`200` answer stays
+/// [`PaykitClientError::NonSuccess`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaykitInvoiceRefusal {
+    /// `409 reader_not_payable`: the reader's App Registry has no app that can
+    /// pay requests. Terminal for this purchase.
+    ReaderNotPayable,
+    /// `503 reader_setup_pending`: the reader has no App Registry yet.
+    ReaderSetupPending,
+    /// `502 reader_registry_malformed`: the reader's published registry is
+    /// invalid.
+    ReaderRegistryMalformed,
+}
+
+impl PaykitInvoiceRefusal {
+    fn from_status_and_code(status: StatusCode, code: &str) -> Option<Self> {
+        match (status, code) {
+            (StatusCode::CONFLICT, "reader_not_payable") => Some(Self::ReaderNotPayable),
+            (StatusCode::SERVICE_UNAVAILABLE, "reader_setup_pending") => {
+                Some(Self::ReaderSetupPending)
+            }
+            (StatusCode::BAD_GATEWAY, "reader_registry_malformed") => {
+                Some(Self::ReaderRegistryMalformed)
+            }
+            _ => None,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct PaykitErrorEnvelope {
+    error: PaykitErrorBody,
+}
+
+#[derive(Deserialize)]
+struct PaykitErrorBody {
+    code: String,
 }
 
 #[derive(Debug, Clone)]
@@ -271,9 +314,13 @@ impl PaykitHttpClient {
         let response = self.signed_post("invoices", request).await?;
 
         if response.status() != StatusCode::OK {
+            let status = response.status();
+            if let Some(refusal) = read_invoice_refusal(response).await {
+                return Err(PaykitClientError::InvoiceRefused(refusal));
+            }
             return Err(PaykitClientError::NonSuccess {
                 operation: "invoice creation",
-                status: response.status(),
+                status,
             });
         }
 
@@ -400,6 +447,31 @@ fn bounded_http_client(
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(PaykitClientError::Http)
+}
+
+async fn read_invoice_refusal(mut response: reqwest::Response) -> Option<PaykitInvoiceRefusal> {
+    let status = response.status();
+    if !matches!(
+        status,
+        StatusCode::CONFLICT | StatusCode::SERVICE_UNAVAILABLE | StatusCode::BAD_GATEWAY
+    ) {
+        return None;
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > INVOICE_BODY_LIMIT as u64)
+    {
+        return None;
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.ok()? {
+        if body.len().saturating_add(chunk.len()) > INVOICE_BODY_LIMIT {
+            return None;
+        }
+        body.extend_from_slice(&chunk);
+    }
+    let envelope: PaykitErrorEnvelope = serde_json::from_slice(&body).ok()?;
+    PaykitInvoiceRefusal::from_status_and_code(status, &envelope.error.code)
 }
 
 async fn parse_connection_status_response(
@@ -759,6 +831,69 @@ mod tests {
             .unwrap();
 
             assert!(client.create_invoice(&invoice_request()).await.is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn create_invoice_types_only_exact_reader_refusals() {
+        let cases: [(StatusCode, &'static str, Option<PaykitInvoiceRefusal>); 8] = [
+            (
+                StatusCode::CONFLICT,
+                r#"{"error":{"code":"reader_not_payable","message":"reader has no Paykit app able to pay requests"}}"#,
+                Some(PaykitInvoiceRefusal::ReaderNotPayable),
+            ),
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                r#"{"error":{"code":"reader_setup_pending","message":"reader wallet setup needed"}}"#,
+                Some(PaykitInvoiceRefusal::ReaderSetupPending),
+            ),
+            (
+                StatusCode::BAD_GATEWAY,
+                r#"{"error":{"code":"reader_registry_malformed","message":"reader registry is malformed"}}"#,
+                Some(PaykitInvoiceRefusal::ReaderRegistryMalformed),
+            ),
+            (
+                StatusCode::CONFLICT,
+                r#"{"error":{"code":"invoice_conflict","message":"invoice conflict"}}"#,
+                None,
+            ),
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                r#"{"error":{"code":"reader_registry_unavailable","message":"reader registry is unavailable"}}"#,
+                None,
+            ),
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                r#"{"error":{"code":"reader_not_payable","message":"wrong status"}}"#,
+                None,
+            ),
+            (
+                StatusCode::BAD_REQUEST,
+                r#"{"error":{"code":"reader_setup_pending","message":"wrong status"}}"#,
+                None,
+            ),
+            (StatusCode::CONFLICT, "not json", None),
+        ];
+        for (status, body, expected) in cases {
+            let server_url = spawn_configured_invoice_server(status, body).await;
+            let client = PaykitHttpClient::from_parts(
+                &server_url,
+                reqwest::Client::new(),
+                Keypair::from_secret(&[9_u8; 32]),
+            )
+            .unwrap();
+
+            let error = client.create_invoice(&invoice_request()).await.unwrap_err();
+            match expected {
+                Some(refusal) => assert!(
+                    matches!(error, PaykitClientError::InvoiceRefused(found) if found == refusal),
+                    "{status} {body}: {error:?}"
+                ),
+                None => assert!(
+                    matches!(error, PaykitClientError::NonSuccess { status: found, .. } if found == status),
+                    "{status} {body}: {error:?}"
+                ),
+            }
         }
     }
 

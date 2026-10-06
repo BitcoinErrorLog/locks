@@ -73,6 +73,7 @@ use crate::paykit_http_client::{PaykitHttpClient, PaykitSetupStatusProvider};
 use crate::rate_limit::{
     InMemoryPaykitConnectionStateLookupRateLimiter, InMemoryVerificationSubmissionRateLimiter,
 };
+use crate::reader_admission::ReaderAdmissionWindows;
 
 #[async_trait]
 pub trait ReaderPubkyResolver: Send + Sync {
@@ -185,6 +186,7 @@ pub struct AppState {
     paykit_connection_state_lookup_rate_limiter:
         Arc<InMemoryPaykitConnectionStateLookupRateLimiter>,
     paykit_connection_status_semaphore: Arc<Semaphore>,
+    reader_admission_windows: Arc<ReaderAdmissionWindows>,
     reader_pubky_resolver: Arc<dyn ReaderPubkyResolver>,
     paykit_http_client: Option<Arc<PaykitHttpClient>>,
     paykit_setup_status_provider: Option<Arc<dyn PaykitSetupStatusProvider>>,
@@ -565,6 +567,7 @@ impl AppState {
             verification_submission_rate_limiter,
             paykit_connection_state_lookup_rate_limiter,
             paykit_connection_status_semaphore,
+            reader_admission_windows: Arc::new(ReaderAdmissionWindows::new()),
             reader_pubky_resolver,
             paykit_http_client,
             paykit_setup_status_provider,
@@ -702,6 +705,10 @@ impl AppState {
 
     pub fn paykit_connection_status_semaphore(&self) -> &Arc<Semaphore> {
         &self.paykit_connection_status_semaphore
+    }
+
+    pub fn reader_admission_windows(&self) -> &Arc<ReaderAdmissionWindows> {
+        &self.reader_admission_windows
     }
 
     pub fn reader_pubky_resolver(&self) -> &Arc<dyn ReaderPubkyResolver> {

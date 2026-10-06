@@ -4,6 +4,7 @@ pub mod config;
 pub mod paykit_http_client;
 pub mod pkdns;
 pub mod rate_limit;
+pub mod reader_admission;
 pub mod runtime;
 pub mod storage;
 pub mod worker;

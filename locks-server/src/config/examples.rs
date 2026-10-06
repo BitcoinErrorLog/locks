@@ -5,8 +5,8 @@ use locks_core::ids::LockServerPubky;
 use tempfile::tempdir;
 
 use crate::config::{
-    ConfigError, PaykitConnectionStateLookupRateLimitConfig, PubkyNetwork, RuntimeEnvironment,
-    load_existing_config_from_path,
+    ConfigError, MAX_TRUSTED_PROXY_HOPS, PaykitConnectionStateLookupRateLimitConfig, PubkyNetwork,
+    RateLimitsConfig, RuntimeEnvironment, load_existing_config_from_path,
 };
 
 #[test]
@@ -313,6 +313,118 @@ fn rejects_zero_paykit_connection_state_lookup_global_burst() {
         error,
         ConfigError::InvalidPaykitConnectionStateLookupGlobalBurst
     ));
+}
+
+#[test]
+fn defaults_trusted_proxy_hops_to_zero_when_absent() {
+    let temp_dir = tempdir().unwrap();
+    let secret_path = temp_dir.path().join("secret.sess");
+    let public_key = test_identity(&secret_path);
+    let config_path = temp_dir.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        minimal_config(&secret_path, &public_key, "development"),
+    )
+    .unwrap();
+
+    let config = load_existing_config_from_path(&config_path).unwrap();
+
+    assert_eq!(config.rate_limits.trusted_proxy_hops, 0);
+}
+
+#[test]
+fn parses_trusted_proxy_hops_up_to_maximum() {
+    let temp_dir = tempdir().unwrap();
+    let secret_path = temp_dir.path().join("secret.sess");
+    let public_key = test_identity(&secret_path);
+    let config_path = temp_dir.path().join("config.toml");
+    for trusted_proxy_hops in [0, 1, 2, MAX_TRUSTED_PROXY_HOPS] {
+        let config = minimal_config(&secret_path, &public_key, "development").replace(
+            "[rate_limits.verification_submission]",
+            &format!(
+                "[rate_limits]\ntrusted_proxy_hops = {trusted_proxy_hops}\n\n[rate_limits.verification_submission]"
+            ),
+        );
+        std::fs::write(&config_path, config).unwrap();
+
+        let config = load_existing_config_from_path(&config_path).unwrap();
+
+        assert_eq!(config.rate_limits.trusted_proxy_hops, trusted_proxy_hops);
+    }
+}
+
+#[test]
+fn rejects_trusted_proxy_hops_above_maximum() {
+    let temp_dir = tempdir().unwrap();
+    let secret_path = temp_dir.path().join("secret.sess");
+    let public_key = test_identity(&secret_path);
+    let config_path = temp_dir.path().join("config.toml");
+    let config = minimal_config(&secret_path, &public_key, "development").replace(
+        "[rate_limits.verification_submission]",
+        &format!(
+            "[rate_limits]\ntrusted_proxy_hops = {}\n\n[rate_limits.verification_submission]",
+            MAX_TRUSTED_PROXY_HOPS + 1
+        ),
+    );
+    std::fs::write(&config_path, config).unwrap();
+
+    let error = load_existing_config_from_path(&config_path).unwrap_err();
+
+    assert!(matches!(
+        error,
+        ConfigError::InvalidTrustedProxyHops {
+            max: MAX_TRUSTED_PROXY_HOPS
+        }
+    ));
+    assert_eq!(
+        error.to_string(),
+        "rate_limits.trusted_proxy_hops must not exceed 8"
+    );
+}
+
+#[test]
+fn rejects_negative_trusted_proxy_hops() {
+    let temp_dir = tempdir().unwrap();
+    let secret_path = temp_dir.path().join("secret.sess");
+    let public_key = test_identity(&secret_path);
+    let config_path = temp_dir.path().join("config.toml");
+    let config = minimal_config(&secret_path, &public_key, "development").replace(
+        "[rate_limits.verification_submission]",
+        "[rate_limits]\ntrusted_proxy_hops = -1\n\n[rate_limits.verification_submission]",
+    );
+    std::fs::write(&config_path, config).unwrap();
+
+    let error = load_existing_config_from_path(&config_path).unwrap_err();
+
+    assert!(matches!(error, ConfigError::ParseConfig { .. }));
+}
+
+#[test]
+fn parses_dev_postgres_example_config() {
+    let temp_dir = tempdir().unwrap();
+    let secret_path = temp_dir.path().join("secret.sess");
+    let public_key = test_identity(&secret_path);
+    let config_path = temp_dir.path().join("config.toml");
+    let config = include_str!("../../config/example.dev.postgres.toml")
+        .replace(
+            "lock_server_secret_key = \"~/.pubky-lock/secret.sess\"",
+            &format!("lock_server_secret_key = \"{}\"", secret_path.display()),
+        )
+        .replace(
+            "lock_server_public_key = \"<derived-on-first-run>\"",
+            &format!("lock_server_public_key = \"{public_key}\""),
+        )
+        .replace(
+            "url_env = \"PUBKY_LOCK_DATABASE_URL\"",
+            "url = \"postgres://locks:locks@localhost/locks_test\"",
+        );
+    std::fs::write(&config_path, config).unwrap();
+
+    let config = load_existing_config_from_path(&config_path).unwrap();
+
+    assert_eq!(config.rate_limits, RateLimitsConfig::default());
+    assert_eq!(config.runtime.environment, RuntimeEnvironment::Development);
+    assert!(config.paykit.is_some());
 }
 
 #[test]

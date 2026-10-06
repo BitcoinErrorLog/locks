@@ -207,6 +207,9 @@ public_icann_http_port = {} # Public HTTP port advertised for ICANN/HTTP access.
 icann_domain = "{}" # ICANN DNS name advertised for HTTP access. Local default is localhost; production should be the public hostname.
 key_republisher_interval_seconds = {} # How often the server republishes identity records. Lower improves recovery from relay loss; higher reduces background traffic.
 
+[rate_limits]
+trusted_proxy_hops = {} # Number of reverse proxies in front of this server that append X-Forwarded-For. 0 keys rate limits by TCP peer and ignores the header; a value above the real proxy count lets clients spoof their rate-limit key. At most 8.
+
 [rate_limits.verification_submission]
 enabled = {} # true limits proof-bundle submissions per creator/client window; false disables this abuse control.
 max_requests = {} # Maximum verification submissions allowed per rate-limit window.
@@ -259,6 +262,7 @@ max_total_resource_bytes = {} # Maximum combined bytes across resources in one c
         config.pkdns.public_icann_http_port.unwrap_or(80),
         config.pkdns.icann_domain.as_deref().unwrap_or("localhost"),
         config.pkdns.key_republisher_interval_seconds,
+        config.rate_limits.trusted_proxy_hops,
         config.rate_limits.verification_submission.enabled,
         config.rate_limits.verification_submission.max_requests,
         config.rate_limits.verification_submission.window_seconds,

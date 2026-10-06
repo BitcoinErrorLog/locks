@@ -11,7 +11,7 @@ use super::defaults::{DEFAULT_CREATOR_AUTHORITY_KEY_ENV, PUBLIC_KEY_PLACEHOLDER}
 use super::schema::{
     ConfigError, ContentLocksConfig, CreatorAuthorityAcquisitionConfig,
     CreatorAuthorityAcquisitionMethod, DatabaseConfig, LegacyConnectAcquisitionConfig,
-    LockServerCredentialsConfig, LockServerRuntimeConfig, LoggingConfig,
+    LockServerCredentialsConfig, LockServerRuntimeConfig, LoggingConfig, MAX_TRUSTED_PROXY_HOPS,
     PAYKIT_REQUEST_TIMEOUT_SECONDS, PaykitConfig, PaykitConnectionStateLookupRateLimitConfig,
     PkdnsConfig, PubkyConfig, PubkyNetwork, PubkyResolution, RateLimitsConfig, RuntimeConfig,
     RuntimeEnvironment, SecretsConfig, VerificationSubmissionRateLimitConfig, WorkerConfig,
@@ -437,6 +437,8 @@ struct RawRuntimeConfig {
 #[derive(Debug, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 struct RawRateLimitsConfig {
+    #[serde(default)]
+    trusted_proxy_hops: usize,
     verification_submission: RawVerificationSubmissionRateLimitConfig,
     #[serde(default)]
     paykit_connection_state_lookup: RawPaykitConnectionStateLookupRateLimitConfig,
@@ -647,7 +649,13 @@ impl RawLoggingConfig {
 
 impl RawRateLimitsConfig {
     fn into_rate_limits_config(self) -> Result<RateLimitsConfig, ConfigError> {
+        if self.trusted_proxy_hops > MAX_TRUSTED_PROXY_HOPS {
+            return Err(ConfigError::InvalidTrustedProxyHops {
+                max: MAX_TRUSTED_PROXY_HOPS,
+            });
+        }
         Ok(RateLimitsConfig {
+            trusted_proxy_hops: self.trusted_proxy_hops,
             verification_submission: self
                 .verification_submission
                 .into_verification_submission_rate_limit_config()?,

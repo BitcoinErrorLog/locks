@@ -592,6 +592,70 @@ async fn paykit_connection_state_lookup_rejects_fixed_window_excess_before_outbo
 }
 
 #[tokio::test]
+async fn paykit_connection_state_lookup_rate_limit_shares_proxy_peer_without_trusted_hops() {
+    let (first, second, calls) = paykit_lookups_from_two_clients_through_proxy(0).await;
+
+    assert_eq!(first, StatusCode::OK);
+    assert_eq!(second, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(calls, 1);
+}
+
+#[tokio::test]
+async fn paykit_connection_state_lookup_rate_limit_keys_forwarded_client_with_trusted_hop() {
+    let (first, second, calls) = paykit_lookups_from_two_clients_through_proxy(1).await;
+
+    assert_eq!(first, StatusCode::OK);
+    assert_eq!(second, StatusCode::OK);
+    assert_eq!(calls, 2);
+}
+
+async fn paykit_lookups_from_two_clients_through_proxy(
+    trusted_proxy_hops: usize,
+) -> (StatusCode, StatusCode, usize) {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let paykit_url = spawn_counting_paykit_connection_status(Arc::clone(&calls)).await;
+    let paykit = Arc::new(
+        PaykitHttpClient::new_for_test(&paykit_url, Keypair::from_secret(&[9_u8; 32])).unwrap(),
+    );
+    let (content_lock, bundle) = paykit_content_lock_and_bundle();
+    let state = test_state_with_paykit_lookup_proxy_hops(1, trusted_proxy_hops)
+        .with_reader_pubky_resolver(Arc::new(AlwaysResolvesReader))
+        .with_paykit_http_client(Some(paykit));
+    seed_content_lock(&state, content_lock).await;
+    let app = router(state);
+    let submit = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/proof-bundles",
+            json!({ "submitted_proof_bundle": bundle.clone() }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(submit.status(), StatusCode::OK);
+    let lookup = |forwarded_for: &str| {
+        json_request_through_proxy(
+            "POST",
+            "/paykit-connection-state-lookups",
+            json!({
+                "creator": bundle.pubky_lock_resource.creator(),
+                "bundle_id": bundle.bundle_id,
+            }),
+            forwarded_for,
+        )
+    };
+
+    let first = app.clone().oneshot(lookup("203.0.113.10")).await.unwrap();
+    let second = app.oneshot(lookup("203.0.113.20")).await.unwrap();
+
+    (
+        first.status(),
+        second.status(),
+        calls.load(Ordering::SeqCst),
+    )
+}
+
+#[tokio::test]
 async fn paykit_connection_state_lookup_rejects_global_in_flight_excess_before_outbound_call() {
     let calls = Arc::new(AtomicUsize::new(0));
     let started = Arc::new(Semaphore::new(0));
@@ -1014,6 +1078,82 @@ async fn post_proof_bundles_rate_limit_is_per_client_address() {
         .unwrap();
 
     assert_eq!(second.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn post_proof_bundles_rate_limit_shares_proxy_peer_without_trusted_hops() {
+    let app = router(test_state_with_rate_limit_and_proxy_hops(1, 0));
+
+    let first = app
+        .clone()
+        .oneshot(json_request_through_proxy(
+            "POST",
+            "/proof-bundles",
+            json!({ "submitted_proof_bundle": submitted_proof_bundle() }),
+            "203.0.113.10",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+
+    let second = app
+        .oneshot(json_request_through_proxy(
+            "POST",
+            "/proof-bundles",
+            json!({ "submitted_proof_bundle": submitted_proof_bundle_with_bundle_id(
+                    "000G40R40M30E209185GR38E1X"
+                ) }),
+            "203.0.113.20",
+        ))
+        .await
+        .unwrap();
+
+    assert_error_response(second, StatusCode::TOO_MANY_REQUESTS, "rate_limited").await;
+}
+
+#[tokio::test]
+async fn post_proof_bundles_rate_limit_keys_forwarded_client_with_trusted_hop() {
+    let app = router(test_state_with_rate_limit_and_proxy_hops(1, 1));
+
+    let first = app
+        .clone()
+        .oneshot(json_request_through_proxy(
+            "POST",
+            "/proof-bundles",
+            json!({ "submitted_proof_bundle": submitted_proof_bundle() }),
+            "203.0.113.10",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+
+    let other_client = app
+        .clone()
+        .oneshot(json_request_through_proxy(
+            "POST",
+            "/proof-bundles",
+            json!({ "submitted_proof_bundle": submitted_proof_bundle_with_bundle_id(
+                    "000G40R40M30E209185GR38E1X"
+                ) }),
+            "203.0.113.20",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(other_client.status(), StatusCode::OK);
+
+    let spoofed = app
+        .oneshot(json_request_through_proxy(
+            "POST",
+            "/proof-bundles",
+            json!({ "submitted_proof_bundle": submitted_proof_bundle_with_bundle_id(
+                    "000G40R40M30E209185GR38E1Y"
+                ) }),
+            "198.51.100.7, 203.0.113.10",
+        ))
+        .await
+        .unwrap();
+
+    assert_error_response(spoofed, StatusCode::TOO_MANY_REQUESTS, "rate_limited").await;
 }
 
 #[tokio::test]
@@ -3316,6 +3456,42 @@ fn test_state_with_rate_limit(enabled: bool, max_requests: u32, window_seconds: 
     AppState::new_empty_in_memory(config)
 }
 
+fn test_state_with_rate_limit_and_proxy_hops(
+    max_requests: u32,
+    trusted_proxy_hops: usize,
+) -> AppState {
+    let mut config = test_config(RuntimeEnvironment::Development, true);
+    config.rate_limits = RateLimitsConfig {
+        trusted_proxy_hops,
+        verification_submission: VerificationSubmissionRateLimitConfig {
+            enabled: true,
+            max_requests,
+            window_seconds: 60,
+        },
+        ..RateLimitsConfig::default()
+    };
+    AppState::new_empty_in_memory(config)
+}
+
+fn test_state_with_paykit_lookup_proxy_hops(
+    max_requests: u32,
+    trusted_proxy_hops: usize,
+) -> AppState {
+    let mut config = test_config(RuntimeEnvironment::Development, true);
+    config.rate_limits.trusted_proxy_hops = trusted_proxy_hops;
+    config
+        .rate_limits
+        .paykit_connection_state_lookup
+        .max_requests = max_requests;
+    AppState::new_empty_in_memory_with_creator_repositories(
+        config,
+        Arc::new(InMemoryContentLockRepository::new()),
+        Arc::new(InMemoryGuardedResourceRepository::new()),
+        Arc::new(InMemoryLockServicePointerRepository::new()),
+        Arc::new(InMemoryEntitlementRepository::new()),
+    )
+}
+
 fn test_state_with_paykit_lookup_admission(
     max_requests: u32,
     window_seconds: u64,
@@ -4077,6 +4253,19 @@ fn json_request_with_client_address(
         IpAddr::V4(Ipv4Addr::from(ip_octets)),
         12345,
     )));
+    request
+}
+
+fn json_request_through_proxy(
+    method: &str,
+    uri: &str,
+    body: Value,
+    forwarded_for: &str,
+) -> Request<Body> {
+    let mut request = json_request_with_client_address(method, uri, body, [10, 0, 0, 1]);
+    request
+        .headers_mut()
+        .insert("x-forwarded-for", forwarded_for.parse().unwrap());
     request
 }
 

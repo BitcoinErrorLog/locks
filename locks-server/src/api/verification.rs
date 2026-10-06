@@ -5,7 +5,7 @@ use std::time::Instant;
 use axum::Json;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{ConnectInfo, State};
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use locks_core::lock_policy::VerifierType;
 use locks_core::verification::SubmittedProofBundle;
@@ -35,12 +35,13 @@ use crate::paykit_http_client::{
     PaykitClientError, PaykitConnectionStatusRequest, PaykitInvoiceRequest,
 };
 use crate::rate_limit::{
-    PaykitConnectionStateLookupRateLimitKey, VerificationSubmissionRateLimitKey,
+    PaykitConnectionStateLookupRateLimitKey, VerificationSubmissionRateLimitKey, client_ip,
 };
 
 pub(super) async fn submit_proof_bundle(
     State(state): State<AppState>,
-    ConnectInfo(client_address): ConnectInfo<SocketAddr>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     request: Result<Json<SubmitProofBundleHttpRequest>, JsonRejection>,
 ) -> Result<Response, ApiError> {
     let request = parse_json(request)?;
@@ -51,7 +52,11 @@ pub(super) async fn submit_proof_bundle(
         .clone();
     let decision = state.verification_submission_rate_limiter().check(
         &VerificationSubmissionRateLimitKey {
-            client_address: client_address.ip(),
+            client_address: client_ip(
+                peer,
+                &headers,
+                state.config().rate_limits.trusted_proxy_hops,
+            ),
             creator,
         },
         state.clock().now(),
@@ -201,7 +206,8 @@ pub(super) async fn lookup_verification_task(
 
 pub(super) async fn lookup_paykit_connection_state(
     State(state): State<AppState>,
-    ConnectInfo(client_address): ConnectInfo<SocketAddr>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     request: Result<Json<VerificationTaskHandleHttpRequest>, JsonRejection>,
 ) -> Result<Response, ApiError> {
     let request = parse_json(request)?;
@@ -245,7 +251,11 @@ pub(super) async fn lookup_paykit_connection_state(
 
     let decision = state.paykit_connection_state_lookup_rate_limiter().check(
         &PaykitConnectionStateLookupRateLimitKey {
-            client_address: client_address.ip(),
+            client_address: client_ip(
+                peer,
+                &headers,
+                state.config().rate_limits.trusted_proxy_hops,
+            ),
             creator: task.creator.clone(),
             bundle_id: task.submitted_proof_bundle.bundle_id.clone(),
         },

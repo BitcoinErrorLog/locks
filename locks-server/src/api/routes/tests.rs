@@ -622,6 +622,30 @@ async fn post_proof_bundles_setup_pending_resubmits_only_inside_the_fixed_window
 }
 
 #[tokio::test]
+async fn post_proof_bundles_reader_not_payable_closes_an_open_window() {
+    let harness = ReaderAdmissionHarness::new(vec![READER_SETUP_PENDING, READER_NOT_PAYABLE]).await;
+
+    assert_reader_refusal(
+        harness.submit().await,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "reader_wallet_setup_needed",
+    )
+    .await;
+    assert_reader_refusal(
+        harness.submit().await,
+        StatusCode::CONFLICT,
+        "reader_not_payable",
+    )
+    .await;
+
+    // The window is gone, so a resubmission past its deadline reaches Paykit
+    // again instead of being refused as expired.
+    harness.clock.advance(time::Duration::minutes(11));
+    assert_eq!(harness.submit().await.status(), StatusCode::OK);
+    assert_eq!(harness.paykit_calls(), 3);
+}
+
+#[tokio::test]
 async fn post_proof_bundles_malformed_registry_is_retryable_until_setup_completes() {
     let harness = ReaderAdmissionHarness::new(vec![READER_REGISTRY_MALFORMED]).await;
 

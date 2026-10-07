@@ -9,6 +9,7 @@ use super::defaults::DEFAULT_CREATOR_AUTHORITY_KEY_ENV;
 
 pub const PAYKIT_CONNECT_TIMEOUT_SECONDS: u64 = 5;
 pub const PAYKIT_REQUEST_TIMEOUT_SECONDS: u64 = 20;
+pub const MAX_TRUSTED_PROXY_HOPS: usize = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LockServerRuntimeConfig {
@@ -185,6 +186,7 @@ pub struct RuntimeConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RateLimitsConfig {
+    pub trusted_proxy_hops: usize,
     pub verification_submission: VerificationSubmissionRateLimitConfig,
     pub paykit_connection_state_lookup: PaykitConnectionStateLookupRateLimitConfig,
 }
@@ -324,6 +326,8 @@ pub enum ConfigError {
     InvalidDatabaseMaxConnections,
     #[error("worker.poll_interval_ms must be greater than zero")]
     InvalidWorkerPollInterval,
+    #[error("rate_limits.trusted_proxy_hops must not exceed {max}")]
+    InvalidTrustedProxyHops { max: usize },
     #[error(
         "rate_limits.verification_submission.max_requests must be greater than zero when enabled"
     )]

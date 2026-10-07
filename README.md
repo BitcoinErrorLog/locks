@@ -619,6 +619,9 @@ The current Lock Server HTTP implementation protects `POST /proof-bundles` with 
 Default runtime config:
 
 ```toml
+[rate_limits]
+trusted_proxy_hops = 0
+
 [rate_limits.verification_submission]
 enabled = true
 max_requests = 60
@@ -632,6 +635,8 @@ max_entries = 10000
 global_requests_per_second = 50
 global_burst = 50
 ```
+
+`trusted_proxy_hops = 0` keys limits by TCP peer address. Behind reverse proxies that append `X-Forwarded-For`, set it to the number of those proxies; see [docs/RUNTIME.md](docs/RUNTIME.md#client-address-behind-reverse-proxies). A value above the real proxy count lets clients choose their own rate-limit key.
 
 Connection lookup state is capped at `max_entries`. When full, new client/task keys receive the same `429 rate_limited` response until expired windows are evicted.
 The process-wide token bucket permits `global_requests_per_second` sustained lookups with a `global_burst` burst. Defaults reserve half of Paykit Server `v0.1.0-rc3`'s default signed-request rate for invoice creation, payment-status checks, and other callers. Operators using non-default Paykit limits or multiple Locks processes must tune aggregate Locks limits below Paykit's signed-request budget.

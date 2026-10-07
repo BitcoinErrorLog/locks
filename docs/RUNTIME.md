@@ -173,6 +173,33 @@ Every claimed verification task receives a fresh opaque claim token. Retry, comp
 
 Omitting `[paykit]` prevents creation of new payment lifecycle identities and connection-state lookup. Existing exact payment-submission replays still return their persisted lifecycle. Non-payment verifier flows continue to run. New `paykit-payment` submissions return `422 paykit_not_configured`. Staging deployments should omit `[paykit]` until a Paykit Server is deployed and reachable for that environment.
 
+## Client address behind reverse proxies
+
+Per-client rate limits for `POST /proof-bundles` and `POST /paykit-connection-state-lookups` are keyed by client IP. By default the client IP is the TCP peer address. Behind a reverse proxy or load balancer, the TCP peer is the proxy, so every client shares one key.
+
+```toml
+[rate_limits]
+trusted_proxy_hops = 0
+
+[rate_limits.verification_submission]
+enabled = true
+max_requests = 60
+window_seconds = 60
+```
+
+A `[rate_limits]` table still requires `[rate_limits.verification_submission]`.
+
+| `trusted_proxy_hops` | Client IP |
+| --- | --- |
+| `0` (default) | TCP peer address. `X-Forwarded-For` is ignored. |
+| `1`–`8` | The `n`th `X-Forwarded-For` entry counted from the right, across all header lines in order. Entries further left are never used. |
+
+Set `trusted_proxy_hops` to the number of proxies in front of the Lock Server that each append one `X-Forwarded-For` entry. One load balancer is `1`; a CDN in front of a load balancer is `2`. Proxies must append to an incoming `X-Forwarded-For` rather than pass it through unmodified, and the Lock Server must not be reachable except through them.
+
+A value higher than the real proxy count selects an entry the client wrote, so any client can choose its own rate-limit key and bypass per-client limits. A value lower than the real proxy count keys clients by a proxy address, so clients behind that proxy share one key. When `X-Forwarded-For` has fewer than `n` entries, or the selected entry is not an IP address, the TCP peer is used. Values above `8` fail config loading. Real proxy chains are shorter, so a larger value is almost certainly a misconfiguration that trusts client-written entries.
+
+Entries may be an IP address, `ipv4:port`, `[ipv6]`, or `[ipv6]:port`. A bare IPv6 address is never split at a colon. IPv4-mapped IPv6 entries (`::ffff:203.0.113.10`) are keyed as their IPv4 address. Header values are not logged. `X-Real-IP` and `Forwarded` are not read.
+
 ## Runtime storage
 
 Operator-facing readiness uses semantic storage labels:

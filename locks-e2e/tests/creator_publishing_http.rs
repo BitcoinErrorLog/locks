@@ -17,14 +17,15 @@ use locks_server::config::{
     FilesystemLockServerIdentityProvider, LockServerIdentityProvider, PaykitConfig,
 };
 use locks_server::testing::TestServerApp;
-use locks_server::worker::{VerificationWorker, WorkerTick};
+use locks_server::worker::{
+    InvoiceAdmissionWorker, InvoiceWorkerTick, OsFullJitter, VerificationWorker, WorkerTick,
+};
 use locks_service::application::models::FrontendSessionToken;
-use locks_service::application::ports::CriterionVerifier;
 use locks_service::infrastructure::memory::content_locks::InMemoryContentLockRepository;
 use locks_service::infrastructure::memory::entitlements::InMemoryEntitlementRepository;
 use locks_service::infrastructure::memory::guarded_resources::InMemoryGuardedResourceRepository;
 use locks_service::infrastructure::memory::lock_service_pointers::InMemoryLockServicePointerRepository;
-use locks_service::infrastructure::memory::verification_task_claims::InMemoryVerificationTaskClaimer;
+
 use serde_json::json;
 use support::creator_publishing_client::{LocalCreatorPublishingClient, response_bytes};
 use time::Duration;
@@ -553,8 +554,33 @@ async fn creator_publishing_http_paykit_payment_flow_creates_invoice_verifies_an
 
     let submit_json = client.submit_proof_bundle(submitted.clone()).await.unwrap();
     assert_eq!(submit_json["status"], "pending");
+    let submitted_at = time::OffsetDateTime::parse(
+        submit_json["submitted_at"].as_str().unwrap(),
+        &time::format_description::well_known::Rfc3339,
+    )
+    .unwrap();
+    let admission_deadline_at = time::OffsetDateTime::parse(
+        submit_json["admission_deadline_at"].as_str().unwrap(),
+        &time::format_description::well_known::Rfc3339,
+    )
+    .unwrap();
+    assert_eq!(admission_deadline_at, submitted_at + Duration::minutes(10));
     assert!(submit_json.get("connection_state").is_none());
     assert!(submit_json.get("task_id").is_none());
+    let jitter = OsFullJitter;
+    let invoice_worker = InvoiceAdmissionWorker::from_state(
+        test_app.state(),
+        test_app
+            .state()
+            .paykit_http_client()
+            .expect("Paykit client is configured")
+            .as_ref(),
+        &jitter,
+    );
+    assert!(matches!(
+        invoice_worker.run_once().await.unwrap(),
+        InvoiceWorkerTick::Ready(_)
+    ));
     fake_paykit.assert_invoice_created(&lock_resource).await;
     fake_paykit.assert_invoice_count(1).await;
 
@@ -566,7 +592,9 @@ async fn creator_publishing_http_paykit_payment_flow_creates_invoice_verifies_an
     fake_paykit.assert_connection_status_checked().await;
 
     let replay_json = client.submit_proof_bundle(submitted.clone()).await.unwrap();
-    assert_eq!(replay_json, submit_json);
+    let mut expected_replay_json = submit_json;
+    expected_replay_json["admission_deadline_at"] = serde_json::Value::Null;
+    assert_eq!(replay_json, expected_replay_json);
     fake_paykit.assert_invoice_count(1).await;
 
     let mut conflicting = submitted;
@@ -579,36 +607,7 @@ async fn creator_publishing_http_paykit_payment_flow_creates_invoice_verifies_an
     assert_eq!(conflict.body["error"]["code"], "task_state_conflict");
     fake_paykit.assert_invoice_count(1).await;
 
-    let task = test_app
-        .state()
-        .verification_tasks()
-        .get_verification_task_by_handle(&creator(), &bundle_id())
-        .await
-        .unwrap()
-        .expect("submitted task exists");
-    let claimer = InMemoryVerificationTaskClaimer::new(vec![task]);
-    let worker = VerificationWorker::new(
-        test_app.state().verification_tasks().as_ref(),
-        &claimer,
-        test_app.state().content_locks().as_ref(),
-        test_app.state().entitlements().as_ref(),
-        test_app.state().dev_static_verifier().as_ref(),
-        test_app
-            .state()
-            .paykit_payment_verifier()
-            .map(|verifier| verifier.as_ref() as &dyn CriterionVerifier),
-        true,
-        test_app.state().clock().as_ref(),
-        test_app
-            .state()
-            .config()
-            .credentials
-            .lock_server_public_key
-            .clone(),
-        "paykit-e2e-worker".to_owned(),
-        std::time::Duration::from_millis(10),
-        60,
-    );
+    let worker = VerificationWorker::from_state(test_app.state());
     assert!(matches!(
         worker.run_once().await.unwrap(),
         WorkerTick::Completed(_)
